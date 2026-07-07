@@ -1,4 +1,14 @@
-# repo-cheatsheet
+# Chained
+
+Thinking cheat sheets write. Playing with [Chained](https://www.youtube.com/watch?v=iO4YnxDHnig)
+
+* **About Chained**
+
+  > Tatsuya Kitani, natori
+  >
+  > いらないもの
+
+## Cheat sheets
 
 輸入一個 GitHub 倉庫網址，自動生成：
 1. **`<repo>_CHEATSHEET.md`** — 適合人類閱讀的快速上手速查表
