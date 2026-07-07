@@ -1,0 +1,7 @@
+# cache
+.vscode
+.env
+*.pyc
+
+# data
+data/
