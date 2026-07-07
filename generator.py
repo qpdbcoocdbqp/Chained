@@ -1,7 +1,7 @@
 """
 generator.py
-把 collector 打包好的上下文文本丢给本地模型(OpenAI 兼容接口, 如 vLLM / Ollama / LM Studio),
-生成 (1) 人类速查表 (2) LLM agent 可解析版本
+Sends the context text packaged by collector to a local LLM (OpenAI-compatible interface, e.g., vLLM / Ollama / LM Studio),
+and generates (1) Human Cheatsheet (2) LLM agent readable guide.
 """
 import os
 import json
@@ -11,66 +11,72 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# 本地模型的 OpenAI 兼容接口地址, 可用环境变量覆盖
-# 常见默认值:
-#   vLLM / LM Studio: http://localhost:8000/v1 或 http://localhost:1234/v1
-#   Ollama (OpenAI 兼容模式): http://localhost:11434/v1
+# OpenAI-compatible API base URL of the local LLM, can be overridden by environment variable
+# Common defaults:
+#   vLLM / LM Studio: http://localhost:8000/v1 or http://localhost:1234/v1
+#   Ollama (OpenAI-compatible mode): http://localhost:11434/v1
 API_BASE_URL = os.environ.get("LOCAL_LLM_BASE_URL", "http://localhost:8000/v1")
 API_URL = API_BASE_URL.rstrip("/") + "/chat/completions"
 MODEL = os.environ.get("LOCAL_LLM_MODEL", "local-model")
-# 大多数本地模型服务不校验 key，但接口格式要求这个字段存在，给个占位符即可；
-# 如果你的服务需要真实 key，用 LOCAL_LLM_API_KEY 环境变量传入
+# Most local model services do not validate the API key, but the API format requires this field, so a placeholder is provided.
+# If your service requires a real key, pass it via the LOCAL_LLM_API_KEY environment variable.
 API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "not-needed")
 
-HUMAN_CHEATSHEET_PROMPT = """你是一个资深工程师,请根据下面提供的仓库信息,写一份简洁的"速查表"(cheat sheet),
-目标读者是第一次接触这个项目、想快速上手的开发者。
+HUMAN_CHEATSHEET_PROMPT = """你是一個資深工程師，請根據下面提供的倉庫資訊，寫一份專注於「指令操作與 API 呼叫」的簡潔"速查表"(cheat sheet)。
+目標讀者是已經配置好環境、想快速上手進行開發或運維的開發者。
+
+請完全忽略任何關於安裝、部屬、初始化或環境設定的內容。
 
 要求:
-- 用 Markdown 格式
-- 包含: 项目一句话简介 / 安装方式 / 3-6 个最常用的命令或 API 调用示例(附代码块)/ 常见坑或注意事项(如果有)
-- 内容尽量精炼,像一页纸能看完的速查表,不要写成完整教程
-- 不要编造仓库中没有出现的信息,如果信息不足,如实说明
+- 用 Markdown 格式，多用表格、粗體與程式碼區塊，確保極高可讀性
+- 包含: 
+  1. 倉庫一句話核心用途簡介
+  2. 常用指令 / API 分類速查（請用表格呈現：欄位包含指令/API、核心參數、功能說明）
+  3. 3-5 個高頻實戰場景的代碼片段或指令組合技（附程式碼區塊）
+  4. 操作時的常見坑或注意事項（如果有）
+- 內容盡量精煉，像一頁紙能看完的速查表，去除所有過渡性廢話，直接給出核心乾貨
+- 不要編造倉庫中沒有出現的信息，如果信息不足，如實說明
+- 請使用繁體中文輸出
 
-仓库信息如下:
+倉庫資訊如下:
 {context}
 """
 
-AGENT_GUIDE_PROMPT = """你是一个为 LLM agent 准备工具说明文档的助手。请根据下面提供的仓库信息,
-生成一份结构化的 Markdown 文档,目的是让另一个 LLM agent 读了之后,能够知道:
-1. 这个仓库/工具能做什么
-2. 有哪些可调用的功能/命令/API(尽量列出函数名、CLI 子命令名、或 API endpoint)
-3. 每个功能的参数是什么、返回什么
-4. 一个可以直接照抄使用的调用范例
+AGENT_GUIDE_PROMPT = """你是一個為 LLM agent 準備工具說明文檔的助手。請根據下面提供的倉庫資訊，
+生成一份結構化的 Markdown 文檔，目的是讓另一個 LLM agent 讀了之後，能夠知道如何正確調用此工具。
 
-请用如下结构输出(严格按此结构,方便程序解析):
+請完全忽略任何關於安裝（Installation）、環境配置或部屬的事項。專注於可操作的介面與參數。
 
-# AGENT GUIDE: <repo 名称>
+請用如下結構輸出 (嚴格按此結構，方便程式解析):
+
+# AGENT GUIDE: <repo 名稱>
 
 ## Summary
-(一两句话描述这个仓库的用途)
-
-## Installation
-(安装/初始化步骤,简洁的命令)
+(一兩句話描述這個倉庫的用途與核心操作場景)
 
 ## Capabilities
-对每个功能,用以下格式列出:
+對每個可操作的功能、命令或 API（如函數名、CLI 子命令名、或 API endpoint），用以下格式列出：
 
 ### <功能名>
-- description: ...
-- invocation: `具体调用方式,如命令行或函数签名`
-- parameters: ...
-- returns: ...
+- description: (該操作的具體用途)
+- invocation: `具體呼叫或執行方式，如命令列或函數簽名`
+- parameters: (詳細列出必要的參數、選填的 Flags 及其型態/意義)
+- returns: (執行後的返回數據、輸出格式或預期結果)
 - example:
+
 ```
-具体示例代码或命令
+
+具體示例代碼或指令操作
+
 ```
 
-## Notes
-(任何 LLM agent 需要注意的限制、依赖环境变量、认证方式等)
+## Operational Notes
+(任何 LLM agent 在執行指令時需要注意的限制、依賴的環境變數、認證權限、或高風險的操作限制)
 
-不要编造仓库中没有出现的功能。如果信息不足以确定某个细节,请明确写"未在仓库信息中找到"。
+不要編造倉庫中沒有出現的功能。如果資訊不足以確定某個操作細節，請明確寫"未在倉庫資訊中找到"。
+請使用繁體中文輸出。
 
-仓库信息如下:
+倉庫資訊如下:
 {context}
 """
 
@@ -95,17 +101,17 @@ def _call_local_llm(prompt: str) -> str:
         with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"本地模型请求失败: {e.code} {e.read().decode('utf-8')}")
+        raise RuntimeError(f"Local LLM request failed: {e.code} {e.read().decode('utf-8')}")
     except urllib.error.URLError as e:
         raise RuntimeError(
-            f"无法连接到本地模型服务 ({API_URL}): {e.reason}\n"
-            f"请确认服务已启动,或用 LOCAL_LLM_BASE_URL 环境变量指定正确地址"
+            f"Failed to connect to local LLM service ({API_URL}): {e.reason}\n"
+            f"Please ensure the service is running, or specify the correct address using the LOCAL_LLM_BASE_URL environment variable."
         )
 
     try:
         return data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError):
-        raise RuntimeError(f"本地模型返回格式异常: {json.dumps(data, ensure_ascii=False)[:500]}")
+        raise RuntimeError(f"Invalid format returned from local LLM: {json.dumps(data, ensure_ascii=False)[:500]}")
 
 
 def generate_human_cheatsheet(context: str) -> str:

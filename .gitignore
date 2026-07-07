@@ -5,3 +5,7 @@
 
 # data
 data/
+db/
+
+# custom
+dev.md

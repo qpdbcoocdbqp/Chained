@@ -1,14 +1,14 @@
 """
 collector.py
-负责: git clone 目标仓库, 扫描关键文件, 打包成一份"上下文文本"
-供后续丢给 Claude API 分析使用。
+Responsible for: git clone target repository, scanning key files, packaging into a "context text"
+for subsequent analysis using the Claude API.
 """
 import os
 import subprocess
 import tempfile
 import shutil
 
-# 优先级高的文件名(大小写不敏感匹配)
+# High priority filenames (case-insensitive matching)
 PRIORITY_FILES = [
     "readme.md", "readme", "readme.rst", "readme.txt",
     "package.json", "pyproject.toml", "setup.py", "setup.cfg",
@@ -17,16 +17,16 @@ PRIORITY_FILES = [
     "docs/readme.md",
 ]
 
-# 值得整体收录的目录(示例/文档)
+# Directories worth overall inclusion (examples/docs)
 INTEREST_DIRS = ["examples", "example", "docs", "sample", "samples"]
 
-MAX_FILE_CHARS = 6000       # 单文件最大截取长度
-MAX_TOTAL_CHARS = 60000     # 总打包内容上限,避免超出上下文
+MAX_FILE_CHARS = 6000       # Maximum slice length of a single file
+MAX_TOTAL_CHARS = 60000     # Upper limit of total packaged content to avoid exceeding context
 IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", "build", ".venv", "venv"}
 
 
 def clone_repo(repo_url: str) -> str:
-    """浅克隆仓库到临时目录,返回本地路径"""
+    """Shallow clone the repository to a temporary directory and return the local path"""
     tmp_dir = tempfile.mkdtemp(prefix="repo_cheatsheet_")
     print(f"Cloning {repo_url} -> {tmp_dir}")
     result = subprocess.run(
@@ -40,7 +40,7 @@ def clone_repo(repo_url: str) -> str:
 
 
 def get_dir_tree(root: str, max_depth: int = 2) -> str:
-    """生成目录结构(限制深度), 帮助 LLM 了解项目布局"""
+    """Generate directory structure (limited depth) to help LLM understand the project layout"""
     lines = []
     root_depth = root.rstrip(os.sep).count(os.sep)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -57,7 +57,7 @@ def get_dir_tree(root: str, max_depth: int = 2) -> str:
         for f in sorted(filenames):
             if not f.startswith("."):
                 lines.append(f"{indent}  {f}")
-    return "\n".join(lines[:300])  # 防止超大仓库刷屏
+    return "\n".join(lines[:300])  # Prevent screen flooding from huge repositories
 
 
 def read_file_safe(path: str, max_chars: int = MAX_FILE_CHARS) -> str:
@@ -66,11 +66,11 @@ def read_file_safe(path: str, max_chars: int = MAX_FILE_CHARS) -> str:
             content = f.read(max_chars)
         return content
     except Exception as e:
-        return f"[无法读取: {e}]"
+        return f"[Cannot read: {e}]"
 
 
 def collect_priority_files(root: str) -> dict:
-    """在仓库根目录及一层子目录中查找优先文件"""
+    """Search for priority files in the repository root directory and one level of subdirectories"""
     found = {}
     lower_map = {}
     for dirpath, dirnames, filenames in os.walk(root):
@@ -93,7 +93,7 @@ def collect_priority_files(root: str) -> dict:
 
 
 def collect_interest_dirs(root: str) -> dict:
-    """收录 examples/docs 等目录下的少量代表性文件"""
+    """Collect a small number of representative files under directories like examples/docs"""
     collected = {}
     total_chars = 0
     for d in INTEREST_DIRS:
@@ -104,7 +104,7 @@ def collect_interest_dirs(root: str) -> dict:
         for dirpath, dirnames, filenames in os.walk(dir_path):
             dirnames[:] = [x for x in dirnames if x not in IGNORE_DIRS and not x.startswith(".")]
             for f in sorted(filenames):
-                if count >= 5:  # 每个目录最多取 5 个文件示例
+                if count >= 5:  # Take at most 5 file examples per directory
                     break
                 if total_chars > MAX_TOTAL_CHARS:
                     return collected
@@ -117,25 +117,39 @@ def collect_interest_dirs(root: str) -> dict:
     return collected
 
 
-def build_context_bundle(repo_url: str) -> str:
-    """主函数: 克隆 + 扫描 + 打包成一份文本"""
+def build_context_bundle(repo_url: str):
+    """Main function: clone + scan + package into a single text
+
+    Returns (bundle, scanned_files, truncated):
+        bundle        -- Packaged context text
+        scanned_files -- List of files actually read this time,
+                         each item is a dict: {"path": relative path, "category": "priority"|"example", "chars": actual character count}
+        truncated     -- bool, whether the packaged content was truncated due to exceeding MAX_TOTAL_CHARS
+    """
     local_path = clone_repo(repo_url)
     try:
         tree = get_dir_tree(local_path)
         priority_files = collect_priority_files(local_path)
         example_files = collect_interest_dirs(local_path)
 
-        parts = [f"# Repository: {repo_url}\n", "## 目录结构 (部分)\n```\n" + tree + "\n```\n"]
+        parts = [f"# Repository: {repo_url}\n", "## Directory Structure (Partial)\n```\n" + tree + "\n```\n"]
+        scanned_files = []
 
         for path, content in priority_files.items():
-            parts.append(f"## 文件: {path}\n```\n{content}\n```\n")
+            parts.append(f"## File: {path}\n```\n{content}\n```\n")
+            scanned_files.append({"path": path, "category": "priority", "chars": len(content)})
 
         for path, content in example_files.items():
-            parts.append(f"## 示例文件: {path}\n```\n{content}\n```\n")
+            parts.append(f"## Example File: {path}\n```\n{content}\n```\n")
+            scanned_files.append({"path": path, "category": "example", "chars": len(content)})
 
         bundle = "\n".join(parts)
+        truncated = False
         if len(bundle) > MAX_TOTAL_CHARS:
-            bundle = bundle[:MAX_TOTAL_CHARS] + "\n\n[内容过长,已截断]"
-        return bundle
+            bundle = bundle[:MAX_TOTAL_CHARS] + "\n\n[Content too long, truncated]"
+            truncated = True
+
+        return bundle, scanned_files, truncated
     finally:
         shutil.rmtree(local_path, ignore_errors=True)
+
