@@ -1,31 +1,58 @@
 #!/usr/bin/env python3
 """
-semantic_search.py — 對一批 <repo_name>/CHEATSHEET.md（或 AGENT_GUIDE.md）
-做語意分塊索引與搜尋。
+semantic_search.py — Semantic chunking, indexing, and search over a folder of
+<repo_name>/CHEATSHEET.md (or AGENT_GUIDE.md) files.
 
-用法：
-    # 1. 建立索引（掃描資料夾，遞迴尋找 CHEATSHEET.md / AGENT_GUIDE.md）
-    python3 semantic_search.py build --root /path/to/cheatsheets --index index.json
+Usage:
+    # 1. Build an index (recursively scans the folder for CHEATSHEET.md / AGENT_GUIDE.md)
+    python3 semantic_search.py build --root /path/to/cheatsheets --backend json --index index.json
+    python3 semantic_search.py build --root /path/to/cheatsheets --backend lancedb --uri ./lancedb_data
 
-    # 2. 搜尋
-    python3 semantic_search.py search --index index.json --query "Milvus 向量搜尋怎麼用" --top-k 5
+    # 2. Search
+    python3 semantic_search.py search --backend json --index index.json --query "how do I do vector search in Milvus" --top-k 5
+    python3 semantic_search.py search --backend lancedb --uri ./lancedb_data --query "..." --top-k 5
 
-Embedding 後端優先順序：
-    1. fastembed（預設）— 本地 ONNX 量化模型，第一次執行會自動下載模型到本地
-       快取（~/.cache/fastembed），之後完全離線、免 API key、免起任何伺服器。
-       預設模型為多語言的 paraphrase-multilingual-MiniLM-L12-v2，中英文皆可用。
-    2. 本地 OpenAI-compatible /embeddings 端點（若設定了 LOCAL_EMBEDDING_BASE_URL，
-       會覆蓋 fastembed，改用你自己起的伺服器）
-    3. 都不可用（fastembed 未安裝、且沒設本地端點）則報錯並提示安裝方式
+Storage backends:
+    --backend json      Simple JSON file index (default). Good for small/local use, no
+                         extra services required.
+    --backend lancedb    LanceDB table. --uri can be a local path (e.g. ./lancedb_data)
+                         or an S3-compatible URI (e.g. s3://bucket/prefix) backed by
+                         MinIO — see MinIO environment variables below.
 
-環境變數（與專案既有的 LOCAL_LLM_* 命名風格一致，皆為選用）：
-    LOCAL_EMBEDDING_BASE_URL   e.g. http://localhost:1234/v1  （設了才會啟用）
+Embedding backend priority:
+    1. fastembed (default) — local ONNX quantized model. The model is downloaded once
+       to a local cache (~/.cache/fastembed) on first run, then works fully offline,
+       with no API key and no server to run.
+       Default model is the multilingual paraphrase-multilingual-MiniLM-L12-v2, which
+       supports both English and Chinese.
+    2. Local OpenAI-compatible /embeddings endpoint (if LOCAL_EMBEDDING_BASE_URL is
+       set, this overrides fastembed and uses your own local server instead)
+    3. If neither is available (fastembed not installed, and no local endpoint set),
+       an error is raised with installation instructions.
+
+Environment variables (optional, following the project's existing LOCAL_LLM_* naming
+convention):
+    LOCAL_EMBEDDING_BASE_URL   e.g. http://localhost:1234/v1  (only takes effect if set)
     LOCAL_EMBEDDING_MODEL      e.g. text-embedding-nomic-embed-text-v1.5
-    LOCAL_EMBEDDING_API_KEY    e.g. lm-studio（有些本地伺服器不檢查，但仍需給值）
-    FASTEMBED_MODEL            覆蓋 fastembed 預設模型名稱（見 fastembed 支援清單）
+    LOCAL_EMBEDDING_API_KEY    e.g. lm-studio (some local servers ignore this but still
+                                require a value to be sent)
+    FASTEMBED_MODEL            override the default fastembed model name (see fastembed's
+                                supported model list)
 
-安裝 fastembed（首次使用建議）：
+MinIO / S3-compatible storage environment variables (only used with --backend lancedb
+and an s3:// --uri):
+    MINIO_ENDPOINT      e.g. http://localhost:9000
+    MINIO_ACCESS_KEY    access key / username
+    MINIO_SECRET_KEY    secret key / password
+    MINIO_REGION        default: us-east-1 (required by the S3 protocol even though
+                         MinIO itself doesn't really use regions)
+    MINIO_ALLOW_HTTP    default: true (set to "false" if your MinIO is behind HTTPS)
+
+Install fastembed (recommended for first-time use):
     pip install fastembed --break-system-packages
+
+Install lancedb (only needed for --backend lancedb):
+    pip install lancedb --break-system-packages
 """
 
 import argparse
@@ -39,13 +66,15 @@ import urllib.error
 from pathlib import Path
 
 # --------------------------------------------------------------------------
-# 分塊：依 Markdown 標題 (## / ###) 切分，保留標題階層作為 context
+# Chunking: split by Markdown headings (## / ###), keeping the heading
+# hierarchy as context for each chunk.
 # --------------------------------------------------------------------------
 
 def chunk_markdown(text: str, min_chars: int = 40):
     """
-    依標題切分成塊。每個 chunk 帶著它所屬的標題路徑（heading breadcrumb），
-    這樣搜尋結果才知道是哪個章節底下的內容。
+    Split a Markdown document into chunks by heading. Each chunk carries a
+    "breadcrumb" of the heading path it belongs to, so search results show
+    which section the content came from.
     """
     lines = text.splitlines()
     chunks = []
@@ -67,28 +96,30 @@ def chunk_markdown(text: str, min_chars: int = 40):
             in_code_block = not in_code_block
             buf.append(line)
             continue
+        # Skip heading detection inside fenced code blocks, so that e.g. a
+        # "# comment" in a Python snippet isn't mistaken for a Markdown heading.
         m = None if in_code_block else heading_re.match(line)
         if m:
             flush()
             level = len(m.group(1))
             title = m.group(2).strip()
-            # 彈出比目前層級深或同層的標題
+            # Pop headings that are the same level or deeper than the new one
             current_heading_stack = [h for h in current_heading_stack if h[0] < level]
             current_heading_stack.append((level, title))
-            buf.append(line)  # 標題本身也放進這個 chunk 的開頭
+            buf.append(line)  # keep the heading line itself in this chunk
         else:
             buf.append(line)
     flush()
 
-    # 若整份文件完全沒有標題也切不出東西，就整篇當一塊
+    # If the whole document has no headings at all, treat it as a single chunk
     if not chunks and text.strip():
-        chunks.append({"heading": "(整份文件)", "content": text.strip()})
+        chunks.append({"heading": "(whole document)", "content": text.strip()})
 
     return chunks
 
 
 # --------------------------------------------------------------------------
-# Embedding 後端
+# Embedding backends
 # --------------------------------------------------------------------------
 
 class EmbeddingError(RuntimeError):
@@ -112,15 +143,15 @@ def _embed_via_local_api(texts, base_url, model, api_key):
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise EmbeddingError(
-            f"無法連線到本地 embedding 端點 {url}：{e}\n"
-            f"請確認 LOCAL_EMBEDDING_BASE_URL / LOCAL_EMBEDDING_MODEL 設定正確，"
-            f"且該伺服器有跑在這個位址上。"
+            f"Could not connect to local embedding endpoint {url}: {e}\n"
+            f"Check that LOCAL_EMBEDDING_BASE_URL / LOCAL_EMBEDDING_MODEL are set "
+            f"correctly and that the server is running at that address."
         ) from e
     try:
         data = payload["data"]
         return [item["embedding"] for item in data]
     except (KeyError, TypeError) as e:
-        raise EmbeddingError(f"本地 embedding 端點回傳格式不符預期：{payload}") from e
+        raise EmbeddingError(f"Unexpected response format from local embedding endpoint: {payload}") from e
 
 
 _fastembed_model_cache = {}
@@ -133,12 +164,13 @@ def _embed_via_fastembed(texts, model_name=None):
         from fastembed import TextEmbedding
     except ImportError as e:
         raise EmbeddingError(
-            "未安裝 fastembed，且未設定 LOCAL_EMBEDDING_BASE_URL。\n"
-            "請擇一：\n"
-            "  1) 執行 `pip install fastembed --break-system-packages`"
-            "（推薦，本地 ONNX 模型，免 API key，首次執行會自動下載模型）；或\n"
-            "  2) 設定環境變數 LOCAL_EMBEDDING_BASE_URL / LOCAL_EMBEDDING_MODEL "
-            "指向你自己起的本地 OpenAI-compatible embedding 端點。"
+            "fastembed is not installed, and LOCAL_EMBEDDING_BASE_URL is not set.\n"
+            "Pick one:\n"
+            "  1) Run `pip install fastembed --break-system-packages` "
+            "(recommended — local ONNX model, no API key, model auto-downloads on "
+            "first run); or\n"
+            "  2) Set LOCAL_EMBEDDING_BASE_URL / LOCAL_EMBEDDING_MODEL to point at "
+            "your own local OpenAI-compatible embedding endpoint."
         ) from e
 
     name = model_name or os.environ.get("FASTEMBED_MODEL", DEFAULT_FASTEMBED_MODEL)
@@ -147,9 +179,10 @@ def _embed_via_fastembed(texts, model_name=None):
             _fastembed_model_cache[name] = TextEmbedding(model_name=name)
         except Exception as e:
             raise EmbeddingError(
-                f"fastembed 初始化模型 '{name}' 失敗：{e}\n"
-                f"首次使用需要能連網下載模型檔（存到 ~/.cache/fastembed）。"
-                f"若環境無法連網，請改用 LOCAL_EMBEDDING_BASE_URL 指向本地伺服器。"
+                f"fastembed failed to initialize model '{name}': {e}\n"
+                f"First use requires internet access to download the model file "
+                f"(cached to ~/.cache/fastembed). If this environment has no internet "
+                f"access, use LOCAL_EMBEDDING_BASE_URL to point at a local server instead."
             ) from e
 
     model = _fastembed_model_cache[name]
@@ -159,15 +192,15 @@ def _embed_via_fastembed(texts, model_name=None):
 
 def embed_texts(texts):
     """
-    對一批文字取得向量。
-    預設用 fastembed（本地 ONNX，免 API key）；
-    若設定了 LOCAL_EMBEDDING_BASE_URL，則改用該本地伺服器（override）。
+    Get embedding vectors for a batch of texts.
+    Defaults to fastembed (local ONNX, no API key required); if
+    LOCAL_EMBEDDING_BASE_URL is set, that local server is used instead (override).
     """
     base_url = os.environ.get("LOCAL_EMBEDDING_BASE_URL")
     if base_url:
         model = os.environ.get("LOCAL_EMBEDDING_MODEL", "text-embedding-ada-002")
         api_key = os.environ.get("LOCAL_EMBEDDING_API_KEY", "not-needed")
-        # 批次呼叫，避免一次塞太多
+        # Call in batches to avoid sending too much at once
         out = []
         batch_size = 32
         for i in range(0, len(texts), batch_size):
@@ -178,13 +211,14 @@ def embed_texts(texts):
 
 
 # --------------------------------------------------------------------------
-# 索引建立
+# File discovery
 # --------------------------------------------------------------------------
 
 TARGET_FILENAMES = {"cheatsheet.md", "agent_guide.md"}
 
+
 def find_cheatsheet_files(root: Path):
-    """遞迴尋找符合 <repo_name>/CHEATSHEET.md 樣式的檔案（不分大小寫）。"""
+    """Recursively find files matching the <repo_name>/CHEATSHEET.md pattern (case-insensitive)."""
     found = []
     for p in root.rglob("*.md"):
         if p.name.lower() in TARGET_FILENAMES:
@@ -193,7 +227,8 @@ def find_cheatsheet_files(root: Path):
 
 
 def guess_repo_name(file_path: Path, root: Path):
-    """用檔案所在的第一層目錄名當作 repo 名稱；若就在 root 底下，用檔名去掉副檔名。"""
+    """Use the file's immediate parent directory name as the repo name; if the
+    file sits directly under root, fall back to the filename without extension."""
     try:
         rel = file_path.relative_to(root)
     except ValueError:
@@ -204,18 +239,20 @@ def guess_repo_name(file_path: Path, root: Path):
     return file_path.stem
 
 
-def build_index(root_dir: str, index_path: str):
+def collect_chunks(root_dir: str):
+    """Scan root_dir for cheat sheet files, chunk them, and return the list of
+    chunk dicts (without embeddings yet)."""
     root = Path(root_dir).expanduser().resolve()
     if not root.exists():
-        print(f"❌ 找不到資料夾：{root}", file=sys.stderr)
+        print(f"❌ Folder not found: {root}", file=sys.stderr)
         sys.exit(1)
 
     files = find_cheatsheet_files(root)
     if not files:
-        print(f"⚠️ 在 {root} 底下沒找到任何 CHEATSHEET.md / AGENT_GUIDE.md", file=sys.stderr)
+        print(f"⚠️ No CHEATSHEET.md / AGENT_GUIDE.md found under {root}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"📂 找到 {len(files)} 個檔案，開始分塊與 embedding...")
+    print(f"📂 Found {len(files)} file(s), chunking...")
 
     all_chunks = []  # list of dict: repo, file, heading, content
     for f in files:
@@ -229,7 +266,38 @@ def build_index(root_dir: str, index_path: str):
                 "content": c["content"],
             })
 
-    print(f"🧩 共切出 {len(all_chunks)} 個語意區塊，開始呼叫 embedding...")
+    print(f"🧩 Split into {len(all_chunks)} semantic chunk(s).")
+    return all_chunks
+
+
+def cosine_sim(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def print_results(query, scored, top_k):
+    """scored: list of (score, chunk_dict) sorted descending, chunk_dict has
+    repo/heading/content/file keys."""
+    print(f"\n🔍 Query: \"{query}\"  Top {top_k} results:\n")
+    for rank, (sim, c) in enumerate(scored[:top_k], 1):
+        print(f"[{rank}] score={sim:.3f}  repo={c['repo']}  section={c['heading']}")
+        preview = c["content"].strip().replace("\n", " ")
+        if len(preview) > 200:
+            preview = preview[:200] + "..."
+        print(f"    {preview}")
+        print(f"    source file: {c['file']}\n")
+
+
+# --------------------------------------------------------------------------
+# JSON backend
+# --------------------------------------------------------------------------
+
+def build_index_json(root_dir: str, index_path: str):
+    all_chunks = collect_chunks(root_dir)
 
     contents = [c["content"] for c in all_chunks]
     try:
@@ -244,23 +312,10 @@ def build_index(root_dir: str, index_path: str):
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump({"chunks": all_chunks}, f, ensure_ascii=False)
 
-    print(f"✅ 索引已建立：{index_path}（{len(all_chunks)} 筆）")
+    print(f"✅ Index written: {index_path} ({len(all_chunks)} chunk(s))")
 
 
-# --------------------------------------------------------------------------
-# 搜尋
-# --------------------------------------------------------------------------
-
-def cosine_sim(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
-
-
-def search_index(index_path: str, query: str, top_k: int = 5, repo_filter: str = None):
+def search_index_json(index_path: str, query: str, top_k: int = 5, repo_filter: str = None):
     with open(index_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     chunks = data["chunks"]
@@ -268,7 +323,7 @@ def search_index(index_path: str, query: str, top_k: int = 5, repo_filter: str =
     if repo_filter:
         chunks = [c for c in chunks if c["repo"] == repo_filter]
         if not chunks:
-            print(f"⚠️ 找不到 repo 名稱為 '{repo_filter}' 的區塊", file=sys.stderr)
+            print(f"⚠️ No chunks found for repo '{repo_filter}'", file=sys.stderr)
             return
 
     try:
@@ -277,20 +332,116 @@ def search_index(index_path: str, query: str, top_k: int = 5, repo_filter: str =
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
 
-    scored = []
-    for c in chunks:
-        sim = cosine_sim(q_vec, c["embedding"])
-        scored.append((sim, c))
+    scored = [(cosine_sim(q_vec, c["embedding"]), c) for c in chunks]
     scored.sort(key=lambda x: x[0], reverse=True)
+    print_results(query, scored, top_k)
 
-    print(f"\n🔍 查詢：「{query}」　Top {top_k} 結果：\n")
-    for rank, (sim, c) in enumerate(scored[:top_k], 1):
-        print(f"[{rank}] score={sim:.3f}  repo={c['repo']}  section={c['heading']}")
-        preview = c["content"].strip().replace("\n", " ")
-        if len(preview) > 200:
-            preview = preview[:200] + "..."
-        print(f"    {preview}")
-        print(f"    來源檔案: {c['file']}\n")
+
+# --------------------------------------------------------------------------
+# LanceDB (+ optional MinIO) backend
+# --------------------------------------------------------------------------
+
+DEFAULT_LANCEDB_TABLE = "cheatsheet_chunks"
+
+
+def _lancedb_storage_options():
+    """Build storage_options for connecting LanceDB to an S3-compatible
+    endpoint such as MinIO, from environment variables. Returns None if no
+    MinIO endpoint is configured (i.e. the --uri is a plain local path)."""
+    endpoint = os.environ.get("MINIO_ENDPOINT")
+    if not endpoint:
+        return None
+    options = {
+        "endpoint": endpoint,
+        "region": os.environ.get("MINIO_REGION", "us-east-1"),
+        "allow_http": os.environ.get("MINIO_ALLOW_HTTP", "true"),
+    }
+    access_key = os.environ.get("MINIO_ACCESS_KEY")
+    secret_key = os.environ.get("MINIO_SECRET_KEY")
+    if access_key:
+        options["aws_access_key_id"] = access_key
+    if secret_key:
+        options["aws_secret_access_key"] = secret_key
+    return options
+
+
+def _lancedb_connect(uri: str):
+    try:
+        import lancedb
+    except ImportError as e:
+        raise RuntimeError(
+            "lancedb is not installed. Run `pip install lancedb --break-system-packages`."
+        ) from e
+
+    storage_options = _lancedb_storage_options() if uri.startswith("s3://") else None
+    if storage_options:
+        return lancedb.connect(uri, storage_options=storage_options)
+    return lancedb.connect(uri)
+
+
+def build_index_lancedb(root_dir: str, uri: str, table_name: str = DEFAULT_LANCEDB_TABLE):
+    all_chunks = collect_chunks(root_dir)
+
+    contents = [c["content"] for c in all_chunks]
+    try:
+        vectors = embed_texts(contents)
+    except EmbeddingError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
+
+    rows = []
+    for c, v in zip(all_chunks, vectors):
+        rows.append({
+            "repo": c["repo"],
+            "file": c["file"],
+            "heading": c["heading"],
+            "content": c["content"],
+            "vector": v,
+        })
+
+    print(f"🗄️  Connecting to LanceDB at {uri} ...")
+    try:
+        db = _lancedb_connect(uri)
+        # mode="overwrite" so re-running build refreshes the table from scratch
+        db.create_table(table_name, data=rows, mode="overwrite")
+    except Exception as e:
+        print(f"❌ Failed to write to LanceDB: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"✅ LanceDB table '{table_name}' written at {uri} ({len(rows)} chunk(s))")
+
+
+def search_index_lancedb(uri: str, query: str, top_k: int = 5, repo_filter: str = None,
+                          table_name: str = DEFAULT_LANCEDB_TABLE):
+    try:
+        db = _lancedb_connect(uri)
+        tbl = db.open_table(table_name)
+    except Exception as e:
+        print(f"❌ Failed to open LanceDB table '{table_name}' at {uri}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        q_vec = embed_texts([query])[0]
+    except EmbeddingError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
+
+    search_q = tbl.search(q_vec).limit(top_k)
+    if repo_filter:
+        search_q = search_q.where(f"repo = '{repo_filter}'")
+
+    results = search_q.to_list()
+    if not results:
+        print(f"⚠️ No results found" + (f" for repo '{repo_filter}'" if repo_filter else ""))
+        return
+
+    # LanceDB returns a `_distance` column (lower = more similar for the default
+    # L2 metric); convert to a "higher is better" score for consistent display.
+    scored = []
+    for r in results:
+        score = 1.0 / (1.0 + r.get("_distance", 0.0))
+        scored.append((score, r))
+    print_results(query, scored, top_k)
 
 
 # --------------------------------------------------------------------------
@@ -298,25 +449,37 @@ def search_index(index_path: str, query: str, top_k: int = 5, repo_filter: str =
 # --------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Cheat sheet 語意搜尋工具")
+    parser = argparse.ArgumentParser(description="Semantic search over cheat sheets")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_build = sub.add_parser("build", help="掃描資料夾並建立索引")
-    p_build.add_argument("--root", required=True, help="包含 <repo_name>/CHEATSHEET.md 的根資料夾")
-    p_build.add_argument("--index", default="index.json", help="輸出的索引檔路徑")
+    p_build = sub.add_parser("build", help="Scan a folder and build an index")
+    p_build.add_argument("--root", required=True, help="Root folder containing <repo_name>/CHEATSHEET.md files")
+    p_build.add_argument("--backend", choices=["json", "lancedb"], default="json", help="Storage backend")
+    p_build.add_argument("--index", default="index.json", help="[json backend] output index file path")
+    p_build.add_argument("--uri", default="./lancedb_data", help="[lancedb backend] local path or s3://bucket/prefix (MinIO)")
+    p_build.add_argument("--table", default=DEFAULT_LANCEDB_TABLE, help="[lancedb backend] table name")
 
-    p_search = sub.add_parser("search", help="對已建好的索引做語意搜尋")
-    p_search.add_argument("--index", default="index.json", help="索引檔路徑")
-    p_search.add_argument("--query", required=True, help="搜尋查詢字串")
-    p_search.add_argument("--top-k", type=int, default=5, help="回傳前 K 筆結果")
-    p_search.add_argument("--repo", default=None, help="只在指定 repo 名稱底下搜尋")
+    p_search = sub.add_parser("search", help="Run a semantic search against an existing index")
+    p_search.add_argument("--backend", choices=["json", "lancedb"], default="json", help="Storage backend")
+    p_search.add_argument("--index", default="index.json", help="[json backend] index file path")
+    p_search.add_argument("--uri", default="./lancedb_data", help="[lancedb backend] local path or s3://bucket/prefix (MinIO)")
+    p_search.add_argument("--table", default=DEFAULT_LANCEDB_TABLE, help="[lancedb backend] table name")
+    p_search.add_argument("--query", required=True, help="Search query string")
+    p_search.add_argument("--top-k", type=int, default=5, help="Number of top results to return")
+    p_search.add_argument("--repo", default=None, help="Restrict search to a specific repo name")
 
     args = parser.parse_args()
 
     if args.command == "build":
-        build_index(args.root, args.index)
+        if args.backend == "json":
+            build_index_json(args.root, args.index)
+        else:
+            build_index_lancedb(args.root, args.uri, args.table)
     elif args.command == "search":
-        search_index(args.index, args.query, args.top_k, args.repo)
+        if args.backend == "json":
+            search_index_json(args.index, args.query, args.top_k, args.repo)
+        else:
+            search_index_lancedb(args.uri, args.query, args.top_k, args.repo, args.table)
 
 
 if __name__ == "__main__":

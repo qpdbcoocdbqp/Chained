@@ -37,11 +37,16 @@ export LOCAL_LLM_API_KEY=xxx
 
 ## 使用方法
 
-```bash
-python main.py --repo-url https://github.com/psf/requests
-# 或指定輸出目錄
-python main.py --repo-url https://github.com/psf/requests --out-dir ./output
-```
+* Generate cheat sheet
+
+  ```bash
+  python main.py --repo-url https://github.com/psf/requests
+  # 或指定輸出目錄
+  python main.py --repo-url https://github.com/psf/requests --out-dir ./output
+  ```
+
+* [semantic search](docs/semantic_search.md)
+
 
 ## 工作原理
 
