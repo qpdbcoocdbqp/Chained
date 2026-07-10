@@ -7,6 +7,8 @@ import os
 import subprocess
 import tempfile
 import shutil
+from pathlib import Path
+from filescore import priority_score
 
 # High priority filenames (case-insensitive matching)
 PRIORITY_FILES = [
@@ -100,22 +102,25 @@ def collect_interest_dirs(root: str) -> dict:
         dir_path = os.path.join(root, d)
         if not os.path.isdir(dir_path):
             continue
+        print(f"Scanning directory: {dir_path}")
         count = 0
         for dirpath, dirnames, filenames in os.walk(dir_path):
             dirnames[:] = [x for x in dirnames if x not in IGNORE_DIRS and not x.startswith(".")]
             for f in sorted(filenames):
-                if count >= 5:  # Take at most 5 file examples per directory
-                    break
-                if total_chars > MAX_TOTAL_CHARS:
-                    return collected
-                full_path = os.path.join(dirpath, f)
-                rel_path = os.path.relpath(full_path, root)
-                content = read_file_safe(full_path, max_chars=2000)
-                collected[rel_path] = content
-                total_chars += len(content)
-                count += 1
+                file_path = Path(dirpath) / f
+                ## limit the number of files per directory and total characters to avoid exceeding context limits
+                # if count >= 5:  # Take at most 5 file examples per directory
+                #     break
+                # if total_chars > MAX_TOTAL_CHARS:
+                #     return collected
+                if priority_score(file_path, file_path.stat().st_size) > 115:
+                    full_path = os.path.join(dirpath, f)
+                    rel_path = os.path.relpath(full_path, root)
+                    content = read_file_safe(full_path, max_chars=8192)
+                    collected[rel_path] = content
+                    total_chars += len(content)
+                    count += 1
     return collected
-
 
 def build_context_bundle(repo_url: str):
     """Main function: clone + scan + package into a single text
