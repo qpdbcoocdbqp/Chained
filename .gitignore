@@ -6,6 +6,9 @@
 # data
 data/
 db/
+tmp/
+*.pkl
 
 # custom
 dev.md
+dev.py
