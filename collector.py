@@ -9,6 +9,17 @@ import tempfile
 import shutil
 from pathlib import Path
 from filescore import priority_score
+from model.train_ml_scorer import FileScorer
+
+
+scorer = None
+try:
+    scorer = FileScorer.load("llm_scorer.pkl")
+except Exception as err:
+    try:
+        scorer = FileScorer.load("scorer.pkl")
+    except Exception as arr:
+        print("No score model loaded.")
 
 # High priority filenames (case-insensitive matching)
 PRIORITY_FILES = [
@@ -104,23 +115,20 @@ def collect_interest_dirs(root: str) -> dict:
             continue
         print(f"Scanning directory: {dir_path}")
         count = 0
+        scores = []
         for dirpath, dirnames, filenames in os.walk(dir_path):
-            dirnames[:] = [x for x in dirnames if x not in IGNORE_DIRS and not x.startswith(".")]
-            for f in sorted(filenames):
-                file_path = Path(dirpath) / f
-                ## limit the number of files per directory and total characters to avoid exceeding context limits
-                # if count >= 5:  # Take at most 5 file examples per directory
-                #     break
-                # if total_chars > MAX_TOTAL_CHARS:
-                #     return collected
-                if priority_score(file_path, file_path.stat().st_size) > 115:
-                    full_path = os.path.join(dirpath, f)
-                    rel_path = os.path.relpath(full_path, root)
-                    content = read_file_safe(full_path, max_chars=8192)
-                    collected[rel_path] = content
-                    total_chars += len(content)
-                    count += 1
+            all_files = list(map(lambda f: Path(dirpath) / f, filenames))
+            scores += list(map(lambda f: [f, scorer.score(f)], all_files))
+        files_to_scan = list(filter(lambda x: x[1] > 0.8, scores))
+        print(f"Sample: {len(files_to_scan) / len(scores):.2f}")
+        for f in files_to_scan:
+            rel_path = os.path.relpath(f[0], root)
+            content = read_file_safe(f[0], max_chars=2048)
+            collected[rel_path] = content
+            total_chars += len(content)
+            count += 1
     return collected
+
 
 def build_context_bundle(repo_url: str):
     """Main function: clone + scan + package into a single text

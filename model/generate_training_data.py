@@ -185,8 +185,6 @@ def _rule_label(rule_score: float, threshold: float = 0.45) -> int:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-import re as _re  # module-level for use in _label_via_llm before it's imported
-
 def generate(root_dir: str, output_path: str, batch_size: int, rule_only: bool):
     root = Path(root_dir).expanduser().resolve()
     if not root.exists():

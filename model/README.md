@@ -22,12 +22,17 @@ python -m model.generate_training_data --root ./source --output ./model/tmp/trai
 
 # Step 2: Train
 ```bash
+# rule base data
 python -m model.train_ml_scorer train --data ./model/tmp/training_data.jsonl --model scorer.pkl
+
+# llm base data
+python -m model.train_ml_scorer train --data ./model/tmp/llm_training_data.jsonl --model llm_scorer.pkl
 ```
 
 # Step 3: Inference (integrated with git ls-files)
 ```bash
-git -C source/llama.cpp ls-files | python -m model.train_ml_scorer score --model scorer.pkl --top-k 30
+git -C source/llama.cpp ls-files | grep docs | python -m model.train_ml_scorer score --model scorer.pkl --top-k 15
+git -C source/llama.cpp ls-files | grep docs | python -m model.train_ml_scorer score --model llm_scorer.pkl --top-k 15
 ```
 
 # Step 4: Integrate into collector.py
