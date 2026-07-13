@@ -148,6 +148,7 @@ _DEV_CONFIG_NAMES = {
     ".gitignore", ".gitattributes", ".editorconfig",
     "codecov.yml", "sonar-project.properties",
     "composer.json", "build.gradle", "pom.xml",
+    "cmakelists.txt"
 }
 
 # Directory-level internal signal: sitting inside utils/, helpers/, base/ etc.
@@ -395,7 +396,7 @@ def _rule_score(
     # Depth penalty: very deeply nested files are almost always implementation
     # details. Applied on top of src_depth to doubly penalise buried code.
     score -= depth * 0.04
-    if src_depth >= 3:     score -= 0.10   # extra penalty for deeply nested src
+    if src_depth >= 3:     score -= 0.16   # extra penalty for deeply nested src
 
     return max(0.0, min(1.0, score))
 
