@@ -159,7 +159,7 @@ def cmd_train(data_path: str, model_path: str, test_split: float):
 
     # Save model
     model_data = {
-        "pipeline":       pipeline,
+        "pipeline": pipeline,
         "feature_columns": FEATURE_COLUMNS,
         "training_samples": len(X_train),
     }

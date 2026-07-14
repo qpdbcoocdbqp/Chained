@@ -77,25 +77,87 @@ def list_repo_files(repo_root: Path) -> list[str]:
 # LLM labeling
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """\
-You are a technical documentation expert. You will be given a list of file paths
-from a software repository. Your task is to decide which files are worth scanning
-to generate a developer cheatsheet or API reference.
+_SYSTEM_PROMPT = """
+You are a technical documentation expert.
 
-A file is worth scanning (label=1) if it:
-- Contains source code with public APIs, classes, or functions
-- Is a README, usage guide, or example/tutorial
-- Is a project manifest or config that describes capabilities or dependencies
+You will be given a list of file paths from a software repository.
 
-A file is NOT worth scanning (label=0) if it:
-- Is a test file (unit tests, fixtures, mocks)
-- Is auto-generated, compiled, or a binary artifact
-- Is deep inside a vendor/node_modules/build directory
-- Contains only data (CSV, images, lock files)
-- Is CI/CD pipeline config unrelated to the project's API
+Your task is to decide which files are worth scanning to generate a USER CHEATSHEET.
 
-Respond with ONLY a JSON array (no markdown, no preamble). Each element:
-{"path": "<path>", "label": <0 or 1>, "reason": "<one sentence>"}
+The cheatsheet is intended for both human users and LLMs to quickly understand what the package does and how to use it.
+
+Prioritize usage documentation over implementation details.
+
+Decision principle:
+
+Ask yourself:
+"If this were the only file I scanned, would it significantly improve a new user's understanding of how to install, configure, or use the package?"
+
+- If YES, label it 1.
+- If NO, label it 0.
+
+Label a file as 1 ONLY if it is likely to contain user-facing information such as:
+
+- README or documentation
+- Installation or setup instructions
+- Usage guides
+- Quickstart guides
+- Tutorials
+- CLI usage
+- Configuration guides
+- Example or demo programs
+- Sample notebooks
+- Migration guides
+- FAQ or troubleshooting documentation
+
+Examples of paths that are usually label=1:
+
+- README.md
+- docs/**
+- guide/**
+- tutorial/**
+- quickstart/**
+- examples/**
+- samples/**
+- demo/**
+- notebooks/**
+
+Label a file as 0 if it primarily contains implementation or project internals, including:
+
+- Source code (.py, .c, .cc, .cpp, .h, .hpp, .rs, .go, .java, .kt, .swift, etc.)
+- Libraries
+- Internal modules
+- Build scripts (CMakeLists.txt, Makefile, BUILD, Bazel, meson.build, etc.)
+- Project manifests (package.json, pyproject.toml, Cargo.toml, pom.xml, *.csproj, etc.)
+- Tests, fixtures, mocks, benchmarks
+- Generated files
+- Vendor or third-party code
+- node_modules
+- Build artifacts
+- Lock files
+- Binary files
+- Images
+- Data files
+- CI/CD configuration
+
+IMPORTANT:
+
+- Source code should almost always be labeled 0.
+- The ONLY exception is source files inside directories clearly intended for user learning, such as:
+  examples/, example/, demos/, demo/, tutorials/, tutorial/, samples/, notebooks/.
+- Do NOT label files as 1 simply because they define public APIs, classes, or functions.
+- Do NOT infer content from the programming language alone.
+- When uncertain, prefer label=0.
+
+Respond with ONLY a JSON array (no markdown, no preamble).
+
+Each element must have the following format:
+
+{
+  "path": "<path>",
+  "label": 0 or 1,
+  "reason": "<one concise sentence>"
+}
 """
 
 
@@ -110,7 +172,7 @@ def _call_llm(file_list: list[str], base_url: str, model: str, api_key: str) -> 
             {"role": "user",   "content": user_msg},
         ],
         "temperature": 0.0,  # deterministic output for reproducible labels
-        "max_tokens": 4096,
+        "max_tokens": 16384,
     }).encode("utf-8")
 
     req = urllib.request.Request(
