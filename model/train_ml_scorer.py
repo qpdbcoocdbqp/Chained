@@ -294,20 +294,27 @@ class FileScorer:
         pipeline, feature_columns = _load_model(model_path)
         return cls(pipeline, feature_columns)
 
-    def score(self, rel_path: str) -> float:
+    def score(self, rel_path: str, ref_count: int = 0) -> float:
         """Return a probability score in [0, 1] for a single file path."""
-        feats = features_to_vector(extract_features(rel_path))
+        feats = features_to_vector(extract_features(rel_path, ref_count=ref_count))
         return float(self._pipeline.predict_proba([feats])[0][1])
 
-    def rank(self, rel_paths: list[str]) -> list[tuple[float, str]]:
-        """Score and rank a list of paths. Returns [(score, path), ...] descending."""
-        X = [features_to_vector(extract_features(p)) for p in rel_paths]
+    def rank(self, rel_paths: list[str], ref_counts: dict[str, int] | None = None) -> list[tuple[float, str]]:
+        """Score and rank a list of paths. Returns [(score, path), ...] descending.
+
+        Parameters
+        ----------
+        rel_paths  : list of relative file paths
+        ref_counts : optional dict mapping path → reference count (from build_ref_counts)
+        """
+        rc = ref_counts or {}
+        X = [features_to_vector(extract_features(p, ref_count=rc.get(p, 0))) for p in rel_paths]
         probas = self._pipeline.predict_proba(X)[:, 1]
         return sorted(zip(probas.tolist(), rel_paths), reverse=True)
 
-    def filter(self, rel_path: str, threshold: float = 0.5) -> bool:
+    def filter(self, rel_path: str, threshold: float = 0.5, ref_count: int = 0) -> bool:
         """Return True if the file should be scanned."""
-        return self.score(rel_path) >= threshold
+        return self.score(rel_path, ref_count=ref_count) >= threshold
 
 
 # ---------------------------------------------------------------------------

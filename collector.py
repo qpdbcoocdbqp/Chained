@@ -105,28 +105,71 @@ def collect_priority_files(root: str) -> dict:
     return found
 
 
-def collect_interest_dirs(root: str) -> dict:
-    """Collect a small number of representative files under directories like examples/docs"""
-    collected = {}
-    total_chars = 0
-    for d in INTEREST_DIRS:
-        dir_path = os.path.join(root, d)
-        if not os.path.isdir(dir_path):
+MAX_SECONDARY_FILES = 20    # Maximum number of secondary files to include
+SECONDARY_THRESHOLD = 0.5  # Minimum score to be considered
+SECONDARY_FILE_CHARS = 2048
+
+
+def collect_secondary_files(root: str) -> dict:
+    """Score every file in the repo and return the top candidates.
+
+    Instead of restricting to INTEREST_DIRS upfront (which misses important
+    files in src/, shallow package roots, CLI entry points, etc.), we walk the
+    entire tree, score each file with the ML/rule-based scorer, and keep only
+    the highest-ranked ones.  INTEREST_DIRS is kept as a soft prior via the
+    scorer's `in_examples` / `in_docs` features, so example files still rank
+    well without being the *only* things considered.
+
+    Reference counts (how many other files import each file) are computed once
+    for the whole repo and injected into the scorer as an extra signal, so
+    heavily-imported API modules rank higher than isolated helper files.
+    """
+    from model.file_features import build_ref_counts, extract_features, features_to_vector
+
+    # Collect all candidate file paths first
+    all_rel: list[str] = []
+    abs_map: dict[str, Path] = {}   # rel_path str → abs Path
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS and not d.startswith(".")]
+        for fname in filenames:
+            abs_path = Path(dirpath) / fname
+            rel = str(abs_path.relative_to(root))
+            all_rel.append(rel)
+            abs_map[rel] = abs_path
+
+    # Compute cross-file reference counts for the whole repo in one pass
+    print(f"Building reference counts for {len(all_rel)} files...")
+    ref_counts = build_ref_counts(root, all_rel)
+
+    all_scores: list[tuple[float, str]] = []
+    for rel, abs_path in abs_map.items():
+        try:
+            if scorer is None:
+                from filescore import priority_score as _ps
+                raw = _ps(rel)
+                score = min(raw / 100.0, 1.0)
+            else:
+                from model.file_features import features_to_vector
+                feats = extract_features(rel, ref_count=ref_counts.get(rel, 0))
+                score = float(scorer._pipeline.predict_proba(
+                    [features_to_vector(feats)]
+                )[0][1])
+        except Exception:
             continue
-        print(f"Scanning directory: {dir_path}")
-        count = 0
-        scores = []
-        for dirpath, dirnames, filenames in os.walk(dir_path):
-            all_files = list(map(lambda f: Path(dirpath) / f, filenames))
-            scores += list(map(lambda f: [f, scorer.score(f)], all_files))
-        files_to_scan = list(filter(lambda x: x[1] > 0.8, scores))
-        print(f"Sample: {len(files_to_scan) / len(scores):.2f}")
-        for f in files_to_scan:
-            rel_path = os.path.relpath(f[0], root)
-            content = read_file_safe(f[0], max_chars=2048)
-            collected[rel_path] = content
-            total_chars += len(content)
-            count += 1
+        if score >= SECONDARY_THRESHOLD:
+            all_scores.append((score, rel))
+
+    all_scores.sort(reverse=True)
+    top_files = all_scores[:MAX_SECONDARY_FILES]
+
+    print(f"Secondary files: {len(all_scores)} candidates >= {SECONDARY_THRESHOLD}, "
+          f"keeping top {len(top_files)}")
+
+    collected = {}
+    for score, rel in top_files:
+        content = read_file_safe(str(abs_map[rel]), max_chars=SECONDARY_FILE_CHARS)
+        collected[rel] = content
+
     return collected
 
 
@@ -143,7 +186,7 @@ def build_context_bundle(repo_url: str):
     try:
         tree = get_dir_tree(local_path)
         priority_files = collect_priority_files(local_path)
-        example_files = collect_interest_dirs(local_path)
+        example_files = collect_secondary_files(local_path)
 
         parts = [f"# Repository: {repo_url}\n", "## Directory Structure (Partial)\n```\n" + tree + "\n```\n"]
         scanned_files = []

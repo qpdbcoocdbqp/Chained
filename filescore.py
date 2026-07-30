@@ -54,6 +54,89 @@ SKIP_EXTS = {
     ".parquet",
 }
 
+# Exact filenames (case-insensitive) that are never useful for a cheatsheet,
+# regardless of which directory they live in.  These are build scripts, lock
+# files, editor configs, CI configs, and other developer-internal artefacts
+# that the rule_score path heuristics cannot reliably exclude on their own
+# (e.g. a CMakeLists.txt inside examples/ still gets an in_examples bonus).
+SKIP_NAMES = {
+    # Build systems
+    "cmakelists.txt",
+    "makefile",
+    "gnumakefile",
+    "meson.build",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "gradlew",
+    "gradlew.bat",
+    "build.bazel",
+    "workspace",
+    "workspace.bazel",
+    "buck",
+    "buildfile",
+    # Android / mobile packaging
+    "proguard-rules.pro",
+    "consumer-rules.pro",
+    "androidmanifest.xml",
+    # Lock files
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "pipfile.lock",
+    "cargo.lock",
+    "go.sum",
+    "gemfile.lock",
+    "composer.lock",
+    # Linters / formatters / type checkers
+    ".eslintrc",
+    ".eslintrc.js",
+    ".eslintrc.json",
+    ".eslintrc.yml",
+    ".eslintrc.yaml",
+    ".prettierrc",
+    ".prettierrc.js",
+    ".prettierrc.json",
+    ".prettierrc.yml",
+    ".prettierrc.yaml",
+    ".babelrc",
+    "babel.config.js",
+    "babel.config.json",
+    ".flake8",
+    ".pylintrc",
+    "mypy.ini",
+    "ruff.toml",
+    ".rubocop.yml",
+    # Test / CI runners
+    "jest.config.js",
+    "jest.config.ts",
+    "vitest.config.ts",
+    "vitest.config.js",
+    "pytest.ini",
+    "setup.cfg",       # often only contains pytest / flake8 config
+    "tox.ini",
+    # Bundlers
+    "webpack.config.js",
+    "webpack.config.ts",
+    "vite.config.ts",
+    "vite.config.js",
+    "rollup.config.js",
+    # Editor / repo housekeeping
+    ".editorconfig",
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+    ".dockerignore",
+    ".npmignore",
+    # CI/CD
+    "codecov.yml",
+    "sonar-project.properties",
+    ".travis.yml",
+    "appveyor.yml",
+}
+
 SKIP_DIRS = {
     ".git",
     "__pycache__",
@@ -187,7 +270,14 @@ def priority_score(path: str | Path, size_bytes: int | None = None) -> int:
 
     ext = p.suffix.lower()
     stem = p.stem.lower()
+    name = p.name.lower()
     path_str = str(p).replace("\\", "/").lower()
+
+    if ext in SKIP_EXTS:
+        return 0
+
+    if name in SKIP_NAMES:
+        return 0
 
     if ext in SKIP_EXTS:
         return 0

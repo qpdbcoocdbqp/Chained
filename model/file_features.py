@@ -21,6 +21,7 @@ Low priority (developer-facing, despite being code):
 """
 
 import re
+import math
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -191,9 +192,15 @@ _PUBLIC_API_NAME_PATTERN = re.compile(
 # Feature extraction
 # ---------------------------------------------------------------------------
 
-def extract_features(rel_path: str) -> dict:
+def extract_features(rel_path: str, ref_count: int = 0) -> dict:
     """
     Extract a flat feature dict from a relative file path string (user-perspective).
+
+    Parameters
+    ----------
+    rel_path  : relative file path within the repo
+    ref_count : number of other files in the repo that import/require this file
+                (computed by build_ref_counts); defaults to 0 when not available
 
     Features
     --------
@@ -217,12 +224,35 @@ def extract_features(rel_path: str) -> dict:
     is_internal_name  name matches util/helper/mixin/impl/compat patterns
     is_public_api_name name matches client/sdk/api/model/handler patterns
     src_depth         depth *within* the src/lib subtree (0 if not in src)
+    ref_count         raw import/require reference count from other files
+    ref_count_log     log1p(ref_count) — normalised, model-friendly
     rule_score        combined user-perspective score in [0, 1]
     """
     path = Path(rel_path)
     name = path.name.lower()
     stem = path.stem.lower()
     group = ext_group(path)
+
+    # Hard blacklist: filenames that are never useful for a cheatsheet regardless
+    # of directory context (build scripts, lock files, editor configs, etc.).
+    # Import lazily to avoid a circular dependency with filescore.
+    from filescore import SKIP_NAMES
+    if name in SKIP_NAMES:
+        all_groups = ("code", "config", "doc", "data", "test", "other")
+        ext_oh = {f"ext_group_{g}": int(group == g) for g in all_groups}
+        return {
+            **ext_oh,
+            "depth": max(0, len(path.parts) - 1),
+            "in_docs": 0, "in_examples": 0, "in_src": 0, "in_internal": 0,
+            "in_tests": 0, "in_devops": 0, "in_ignored": 1, "in_util_dir": 0,
+            "is_public_api": 0, "is_cli_entry": 0, "is_user_config": 0,
+            "is_dev_config": 1, "is_readme": 0, "is_test_file": 0,
+            "is_example_file": 0, "is_private_module": 0,
+            "is_internal_name": 0, "is_public_api_name": 0,
+            "src_depth": 0, "ref_count": ref_count,
+            "ref_count_log": math.log1p(ref_count),
+            "rule_score": 0.0,
+        }
 
     all_groups = ("code", "config", "doc", "data", "test", "other")
     ext_oh = {f"ext_group_{g}": int(group == g) for g in all_groups}
@@ -295,6 +325,8 @@ def extract_features(rel_path: str) -> dict:
         "is_internal_name":   is_internal_name,
         "is_public_api_name": is_public_api_name,
         "src_depth":          src_depth,
+        "ref_count":          ref_count,
+        "ref_count_log":      math.log1p(ref_count),
         "rule_score":         rule_score,
     }
 
@@ -322,6 +354,7 @@ FEATURE_COLUMNS = [
     "is_public_api", "is_cli_entry", "is_user_config", "is_dev_config",
     "is_readme", "is_test_file", "is_example_file",
     "is_private_module", "is_internal_name", "is_public_api_name",
+    "ref_count", "ref_count_log",
     "rule_score",
 ]
 
@@ -404,3 +437,85 @@ def _rule_score(
 def score_file(rel_path: str) -> float:
     """Convenience function: return just the rule-based score for a path."""
     return extract_features(rel_path)["rule_score"]
+
+
+# ---------------------------------------------------------------------------
+# Reference count builder
+# ---------------------------------------------------------------------------
+
+# Patterns that capture the imported module stem from a source line.
+# We intentionally keep these broad (grep-style) rather than full AST parsing —
+# the goal is a cheap relative signal, not a perfect dependency graph.
+_IMPORT_PATTERNS = [
+    # Python:  from .foo import …  |  from foo.bar import …  |  import foo.bar
+    re.compile(r"""(?:from\s+([\w./\\-]+)\s+import|import\s+([\w./\\-]+))"""),
+    # JS/TS:   import … from './foo'  |  require('./foo')
+    re.compile(r"""(?:from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\))"""),
+    # Go:      import "github.com/foo/bar"
+    re.compile(r"""import\s+["'`]([^"'`]+)["'`]"""),
+    # Rust:    mod foo;  |  use foo::bar;
+    re.compile(r"""(?:^mod\s+(\w+)\s*;|use\s+([\w:]+))""", re.MULTILINE),
+]
+
+_SCANNABLE_EXTS = {
+    ".py", ".go", ".ts", ".tsx", ".js", ".jsx",
+    ".rs", ".java", ".kt", ".rb", ".php", ".swift",
+    ".c", ".cpp", ".cc", ".h", ".hpp",
+}
+
+
+def build_ref_counts(repo_root: str, file_list: list[str]) -> dict[str, int]:
+    """Scan every scannable file in file_list for import/require statements and
+    return a dict mapping relative path → number of files that reference it.
+
+    The matching is intentionally fuzzy: we extract the stem of whatever is
+    being imported and check whether any file in the repo has a matching stem.
+    This avoids the need to resolve full module paths (which requires language-
+    specific tooling) while still capturing the most useful signal.
+
+    Parameters
+    ----------
+    repo_root : absolute path to the cloned repository root
+    file_list : list of relative paths (as returned by list_repo_files or os.walk)
+
+    Returns
+    -------
+    dict mapping rel_path → int  (0 for files never referenced)
+    """
+    root = Path(repo_root)
+    counts: dict[str, int] = {f: 0 for f in file_list}
+
+    # Build a quick lookup: stem (lower) → [rel_path, ...]
+    # We use the stem because import statements rarely include the extension.
+    stem_to_paths: dict[str, list[str]] = {}
+    for rel in file_list:
+        stem = Path(rel).stem.lower()
+        stem_to_paths.setdefault(stem, []).append(rel)
+
+    for rel in file_list:
+        p = root / rel
+        if p.suffix.lower() not in _SCANNABLE_EXTS:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        referenced_stems: set[str] = set()
+        for pat in _IMPORT_PATTERNS:
+            for m in pat.finditer(text):
+                for raw in m.groups():
+                    if not raw:
+                        continue
+                    # Normalise separators and take the last component as stem
+                    stem = Path(raw.replace("\\", "/")).stem.lower()
+                    # Skip obvious non-local references (e.g. "os", "sys", "react")
+                    if len(stem) >= 2:
+                        referenced_stems.add(stem)
+
+        for stem in referenced_stems:
+            for target_rel in stem_to_paths.get(stem, []):
+                if target_rel != rel:           # don't count self-references
+                    counts[target_rel] = counts.get(target_rel, 0) + 1
+
+    return counts

@@ -34,7 +34,10 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-from model.file_features import extract_features, score_file, _IGNORE_DIRS
+from dotenv import load_dotenv
+load_dotenv()
+
+from model.file_features import extract_features, score_file, _IGNORE_DIRS, build_ref_counts
 
 # ---------------------------------------------------------------------------
 # File listing
@@ -280,8 +283,10 @@ def generate(root_dir: str, output_path: str, batch_size: int, rule_only: bool):
             if not files:
                 continue
 
-            # Extract features for all files
-            features_map = {f: extract_features(f) for f in files}
+            # Extract features for all files (with cross-file reference counts)
+            print(f"   Building reference counts...")
+            ref_counts = build_ref_counts(str(repo_dir), files)
+            features_map = {f: extract_features(f, ref_count=ref_counts.get(f, 0)) for f in files}
 
             # LLM labels (optional)
             llm_labels: dict[str, dict] = {}
