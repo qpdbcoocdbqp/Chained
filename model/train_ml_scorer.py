@@ -42,9 +42,12 @@ from model.file_features import FEATURE_COLUMNS, extract_features, features_to_v
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_jsonl(path: str) -> tuple[list, list, list]:
+def load_jsonl(path: str, sources: set[str] | None = None) -> tuple[list, list, list]:
     """
     Read a JSONL file produced by generate_training_data.py.
+
+    sources : keep only records whose "source" is in this set (e.g.
+              {"llm", "auto"}); None keeps everything.
 
     Returns
     -------
@@ -67,6 +70,8 @@ def load_jsonl(path: str) -> tuple[list, list, list]:
             feats = record.get("features")
             label = record.get("label")
             if feats is None or label not in (0, 1):
+                continue
+            if sources is not None and record.get("source", "rule") not in sources:
                 continue
 
             # Re-extract from path if stored features are missing columns
@@ -116,7 +121,7 @@ def _build_pipeline():
 # Training
 # ---------------------------------------------------------------------------
 
-def cmd_train(data_path: str, model_path: str, test_split: float):
+def cmd_train(data_path: str, model_path: str, test_split: float, sources: set[str] | None = None):
     try:
         from sklearn.model_selection import train_test_split
         from sklearn.metrics import classification_report, roc_auc_score
@@ -125,8 +130,9 @@ def cmd_train(data_path: str, model_path: str, test_split: float):
               "   Run: pip install scikit-learn --break-system-packages", file=sys.stderr)
         sys.exit(1)
 
-    print(f"📂 Loading training data from {data_path} ...")
-    X, y, meta = load_jsonl(data_path)
+    print(f"📂 Loading training data from {data_path} "
+          f"(sources: {','.join(sorted(sources)) if sources else 'all'}) ...")
+    X, y, meta = load_jsonl(data_path, sources)
 
     if len(X) == 0:
         print("❌ No valid records found in training data.", file=sys.stderr)
@@ -188,7 +194,7 @@ def _print_feature_importances(pipeline):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def cmd_eval(data_path: str, model_path: str):
+def cmd_eval(data_path: str, model_path: str, sources: set[str] | None = None):
     try:
         from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
     except ImportError:
@@ -196,7 +202,7 @@ def cmd_eval(data_path: str, model_path: str):
         sys.exit(1)
 
     pipeline, _ = _load_model(model_path)
-    X, y, meta = load_jsonl(data_path)
+    X, y, meta = load_jsonl(data_path, sources)
 
     if not X:
         print("❌ No valid records.", file=sys.stderr)
@@ -264,7 +270,26 @@ def _load_model(model_path: str):
         sys.exit(1)
     with open(model_path, "rb") as f:
         data = pickle.load(f)
-    return data["pipeline"], data.get("feature_columns", FEATURE_COLUMNS)
+    pipeline = data["pipeline"]
+    feature_columns = data.get("feature_columns", FEATURE_COLUMNS)
+    _check_feature_compat(model_path, pipeline, feature_columns)
+    return pipeline, feature_columns
+
+
+def _check_feature_compat(model_path: str, pipeline, feature_columns: list) -> None:
+    """Fail loudly when a model was trained on a different feature layout.
+
+    A mismatch otherwise surfaces as a ValueError inside predict_proba, which
+    callers tend to swallow — silently dropping every file from the ranking.
+    """
+    n_expected = getattr(pipeline, "n_features_in_", len(feature_columns))
+    if n_expected != len(FEATURE_COLUMNS) or list(feature_columns) != FEATURE_COLUMNS:
+        raise ValueError(
+            f"{model_path}: trained on {n_expected} features "
+            f"{'(columns differ)' if list(feature_columns) != FEATURE_COLUMNS else ''}"
+            f" but file_features.FEATURE_COLUMNS has {len(FEATURE_COLUMNS)}. "
+            f"Retrain the model."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -330,10 +355,15 @@ def main():
     p_train.add_argument("--model",      default="scorer.pkl", help="Output model file")
     p_train.add_argument("--test-split", type=float, default=0.2,
                          help="Fraction held out for evaluation (0 to skip)")
+    sources_help = ("Comma-separated record sources to use, e.g. 'llm,auto' "
+                    "(default: all). Rule labels are derived from the rule_score "
+                    "feature, so mixing them in makes the model circular.")
+    p_train.add_argument("--sources", default=None, help=sources_help)
 
     p_eval = sub.add_parser("eval", help="Evaluate a saved model against a JSONL file")
     p_eval.add_argument("--data",  required=True, help="Path to evaluation JSONL")
     p_eval.add_argument("--model", default="scorer.pkl")
+    p_eval.add_argument("--sources", default=None, help=sources_help)
 
     p_score = sub.add_parser("score",
                               help="Score file paths from stdin using a saved model")
@@ -345,10 +375,14 @@ def main():
 
     args = parser.parse_args()
 
+    sources = None
+    if getattr(args, "sources", None):
+        sources = {s.strip() for s in args.sources.split(",") if s.strip()}
+
     if args.command == "train":
-        cmd_train(args.data, args.model, args.test_split)
+        cmd_train(args.data, args.model, args.test_split, sources)
     elif args.command == "eval":
-        cmd_eval(args.data, args.model)
+        cmd_eval(args.data, args.model, sources)
     elif args.command == "score":
         cmd_score(args.model, args.top_k, args.threshold)
 

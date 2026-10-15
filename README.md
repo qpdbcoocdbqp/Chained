@@ -23,8 +23,7 @@ Thinking cheat sheets write. Playing with [Chained](https://www.youtube.com/watc
 
 ```bash
 # 本地服務的 base url（注意不含 /chat/completions，腳本會自動拼接）
-export LOCAL_LLM_BASE_URL=http://localhost:8000/v1   # vLLM / LM Studio 常見位址
-# export LOCAL_LLM_BASE_URL=http://localhost:11434/v1  # Ollama (OpenAI 相容模式)
+export LOCAL_LLM_BASE_URL=http://localhost:8000/v1   # vLLM / LM 
 
 # 本地服務中載入的模型名稱（需與服務端一致，例如 Ollama 的 "qwen2.5:7b" 這類）
 export LOCAL_LLM_MODEL=your-model-name

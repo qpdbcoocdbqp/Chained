@@ -12,19 +12,32 @@ from filescore import priority_score
 from model.train_ml_scorer import FileScorer
 
 
-scorer = None
-try:
-    scorer = FileScorer.load("llm_scorer.pkl")
-except Exception as err:
-    try:
-        scorer = FileScorer.load("scorer.pkl")
-    except Exception as arr:
-        print("No score model loaded.")
+# Tried in order; the first one compatible with the current feature layout wins.
+SCORER_MODELS = ["scorer_v3.pkl", "scorer_v2.pkl", "llm_scorer.pkl", "scorer.pkl"]
+
+
+def _load_scorer() -> FileScorer | None:
+    base = Path(__file__).resolve().parent
+    for name in SCORER_MODELS:
+        try:
+            loaded = FileScorer.load(str(base / name))
+        except SystemExit:      # _load_model exits when the file is missing
+            continue
+        except Exception as err:
+            print(f"Skipping score model {name}: {err}")
+            continue
+        print(f"Loaded score model: {name}")
+        return loaded
+    print("No score model loaded; falling back to filescore.priority_score.")
+    return None
+
+
+scorer = _load_scorer()
 
 # High priority filenames (case-insensitive matching)
 PRIORITY_FILES = [
     "readme.md", "readme", "readme.rst", "readme.txt",
-    "package.json", "pyproject.toml", "setup.py", "setup.cfg",
+    "package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
     "cargo.toml", "go.mod", "gemfile", "pom.xml", "build.gradle",
     "contributing.md", "usage.md", "getting_started.md", "quickstart.md",
     "docs/readme.md",
@@ -108,9 +121,120 @@ def collect_priority_files(root: str) -> dict:
 MAX_SECONDARY_FILES = 20    # Maximum number of secondary files to include
 SECONDARY_THRESHOLD = 0.5  # Minimum score to be considered
 SECONDARY_FILE_CHARS = 2048
+MAX_PER_PARENT_DIR = 3      # e.g. at most 3 files from examples/simple/
+MAX_PER_TOP_DIR = 5         # e.g. at most 5 files from examples/ overall
+# Slots reserved for source code; docs outscore code on rule_score, so without
+# a quota READMEs take every slot.  Split so that example code (which already
+# shares examples/ with READMEs) cannot also take the public-API slots.
+MIN_API_CODE_FILES = 3      # public headers / package entry files, most-imported first
+MIN_EXAMPLE_CODE_FILES = 2  # runnable samples
+SCORE_TIE_DECIMALS = 2      # model probabilities saturate near 1.0; treat close scores as ties
 
 
-def collect_secondary_files(root: str) -> dict:
+RULE_SCORE_BUCKET = 0.05      # rule scores this close are compared on content
+STUB_FILE_BYTES = 300         # READMEs smaller than this are usually placeholders
+_DOC_SUFFIXES = {".md", ".mdx", ".rst", ".txt", ".adoc"}
+
+
+def _content_signal(abs_path: Path) -> int:
+    """Cheap content-based usefulness hint for files that already passed the
+    path-based scorer.
+
+    For docs: the number of fenced code blocks / shell prompts, since a
+    cheatsheet is built from runnable commands and snippets.  Near-empty
+    stubs get -1.  Other files: 0 (ref_count covers code).
+    """
+    try:
+        size = abs_path.stat().st_size
+    except OSError:
+        return 0
+    if size < STUB_FILE_BYTES:
+        return -1
+    if abs_path.suffix.lower() not in _DOC_SUFFIXES:
+        return 0
+    text = read_file_safe(str(abs_path), max_chars=64 * 1024)
+    fences = sum(1 for line in text.splitlines() if line.lstrip().startswith(("```", "~~~")))
+    prompts = sum(1 for line in text.splitlines() if line.lstrip().startswith("$ "))
+    return min(fences // 2 + prompts, 30)
+
+
+def _rank_key(score: float, feats: dict, content: int, rel: str) -> tuple:
+    """Sort key: model score first, then deterministic tie-breakers.
+
+    Without tie-breakers a saturated model (hundreds of files at ~1.00) falls
+    back to reverse-alphabetical path order, which is meaningless.
+    """
+    return (
+        -round(score, SCORE_TIE_DECIMALS),
+        -round(feats["rule_score"] / RULE_SCORE_BUCKET),   # finer-grained heuristic signal
+        -content,                  # docs with more runnable snippets first
+        feats["depth"],            # shallower first
+        -feats["ref_count"],       # more widely imported first
+        rel,
+    )
+
+
+def _api_rank_key(score: float, feats: dict, example_refs: int, rel: str) -> tuple:
+    """For public-API code, what the examples import is the best usefulness
+    hint (llama.h, milvusclient), then the overall import count; ref_count
+    alone favours internal hubs such as src/models/models.h or milvus pkg/."""
+    return (
+        -round(score, SCORE_TIE_DECIMALS),
+        -example_refs,
+        -feats["ref_count"],
+        -round(feats["rule_score"] / RULE_SCORE_BUCKET),
+        feats["depth"],
+        rel,
+    )
+
+
+def _is_api_code(feats: dict) -> bool:
+    return bool(feats["ext_group_code"] and (feats["is_public_api"] or feats["is_cli_entry"])
+                and not (feats["in_examples"] or feats["is_example_file"]))
+
+
+def _is_example_code(feats: dict) -> bool:
+    return bool(feats["ext_group_code"] and (feats["in_examples"] or feats["is_example_file"]))
+
+
+def _dir_keys(rel: str) -> tuple[str, str]:
+    parts = Path(rel).parts
+    return str(Path(rel).parent), (parts[0] if len(parts) > 1 else "")
+
+
+def _select_diverse(ranked: list[str], limit: int, picked: list[str] | None = None) -> list[str]:
+    """Pick up to `limit` paths, capping how many come from the same directory
+    so that one directory with many similar files (e.g. 27 examples/*/README.md)
+    cannot crowd out everything else.
+
+    `picked` are paths already chosen (e.g. reserved code slots); they count
+    toward the limit and the per-directory caps."""
+    picked = list(picked or [])
+    per_parent: dict[str, int] = {}
+    per_top: dict[str, int] = {}
+    for rel in picked:
+        parent, top = _dir_keys(rel)
+        per_parent[parent] = per_parent.get(parent, 0) + 1
+        if top:
+            per_top[top] = per_top.get(top, 0) + 1
+    for rel in ranked:
+        if len(picked) >= limit:
+            break
+        if rel in picked:
+            continue
+        parent, top = _dir_keys(rel)
+        if per_parent.get(parent, 0) >= MAX_PER_PARENT_DIR:
+            continue
+        if top and per_top.get(top, 0) >= MAX_PER_TOP_DIR:
+            continue
+        per_parent[parent] = per_parent.get(parent, 0) + 1
+        if top:
+            per_top[top] = per_top.get(top, 0) + 1
+        picked.append(rel)
+    return picked
+
+
+def collect_secondary_files(root: str, exclude: set[str] | None = None) -> dict:
     """Score every file in the repo and return the top candidates.
 
     Instead of restricting to INTEREST_DIRS upfront (which misses important
@@ -123,8 +247,13 @@ def collect_secondary_files(root: str) -> dict:
     Reference counts (how many other files import each file) are computed once
     for the whole repo and injected into the scorer as an extra signal, so
     heavily-imported API modules rank higher than isolated helper files.
+
+    `exclude` holds paths already collected as priority files, so the same
+    README is not packed twice.
     """
     from model.file_features import build_ref_counts, extract_features, features_to_vector
+
+    exclude_norm = {os.path.normcase(os.path.normpath(p)) for p in (exclude or ())}
 
     # Collect all candidate file paths first
     all_rel: list[str] = []
@@ -139,34 +268,41 @@ def collect_secondary_files(root: str) -> dict:
 
     # Compute cross-file reference counts for the whole repo in one pass
     print(f"Building reference counts for {len(all_rel)} files...")
-    ref_counts = build_ref_counts(root, all_rel)
+    example_refs: dict[str, int] = {}
+    ref_counts = build_ref_counts(root, all_rel, example_counts=example_refs)
 
-    all_scores: list[tuple[float, str]] = []
-    for rel, abs_path in abs_map.items():
-        try:
-            if scorer is None:
-                from filescore import priority_score as _ps
-                raw = _ps(rel)
-                score = min(raw / 100.0, 1.0)
-            else:
-                from model.file_features import features_to_vector
-                feats = extract_features(rel, ref_count=ref_counts.get(rel, 0))
-                score = float(scorer._pipeline.predict_proba(
-                    [features_to_vector(feats)]
-                )[0][1])
-        except Exception:
-            continue
-        if score >= SECONDARY_THRESHOLD:
-            all_scores.append((score, rel))
+    candidates = [r for r in all_rel if os.path.normcase(r) not in exclude_norm]
+    feats_map = {r: extract_features(r, ref_count=ref_counts.get(r, 0)) for r in candidates}
 
-    all_scores.sort(reverse=True)
-    top_files = all_scores[:MAX_SECONDARY_FILES]
+    if scorer is None:
+        scores = {r: min(priority_score(r) / 100.0, 1.0) for r in candidates}
+    else:
+        probas = scorer._pipeline.predict_proba(
+            [features_to_vector(feats_map[r]) for r in candidates]
+        )[:, 1] if candidates else []
+        scores = dict(zip(candidates, (float(p) for p in probas)))
 
-    print(f"Secondary files: {len(all_scores)} candidates >= {SECONDARY_THRESHOLD}, "
-          f"keeping top {len(top_files)}")
+    passing = [r for r in candidates if scores[r] >= SECONDARY_THRESHOLD]
+    content_sig = {r: _content_signal(abs_map[r]) for r in passing}
+    passing.sort(key=lambda r: _rank_key(scores[r], feats_map[r], content_sig[r], r))
+
+    # Docs carry a higher base rule_score than code, so without a quota the
+    # public headers / API modules lose every slot to READMEs.
+    api_code = sorted((r for r in passing if _is_api_code(feats_map[r])),
+                      key=lambda r: _api_rank_key(scores[r], feats_map[r], example_refs.get(r, 0), r))
+    example_code = [r for r in passing if _is_example_code(feats_map[r])]   # already in rank order
+    reserved = _select_diverse(api_code, MIN_API_CODE_FILES)
+    reserved = _select_diverse(example_code, len(reserved) + MIN_EXAMPLE_CODE_FILES, picked=reserved)
+    top_files = _select_diverse(passing, MAX_SECONDARY_FILES, picked=reserved)
+    order = {r: i for i, r in enumerate(passing)}
+    top_files.sort(key=order.__getitem__)
+
+    print(f"Secondary files: {len(passing)} candidates >= {SECONDARY_THRESHOLD} "
+          f"({len(api_code)} API code, {len(example_code)} example code), "
+          f"keeping top {len(top_files)} ({len(reserved)} reserved for code)")
 
     collected = {}
-    for score, rel in top_files:
+    for rel in top_files:
         content = read_file_safe(str(abs_map[rel]), max_chars=SECONDARY_FILE_CHARS)
         collected[rel] = content
 
@@ -186,7 +322,7 @@ def build_context_bundle(repo_url: str):
     try:
         tree = get_dir_tree(local_path)
         priority_files = collect_priority_files(local_path)
-        example_files = collect_secondary_files(local_path)
+        example_files = collect_secondary_files(local_path, exclude=set(priority_files))
 
         parts = [f"# Repository: {repo_url}\n", "## Directory Structure (Partial)\n```\n" + tree + "\n```\n"]
         scanned_files = []
