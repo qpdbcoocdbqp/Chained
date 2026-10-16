@@ -42,6 +42,13 @@ python -m model.generate_training_data --root ./source \
 | `--no-verify` | off | Skip the second pass that re-checks label-1 files |
 | `--cache PATH` | `model/tmp/llm_label_cache.jsonl` | Label cache, `''` to disable |
 | `--seed N` | 42 | Seed for the `--max-llm-files` sample |
+| `--workers N` | 1 | LLM batches in flight at once; raise it (e.g. 8) for a batching server such as vLLM |
+
+To label on a Colab GPU with an open model served by vLLM, open
+[`colab_labeling.ipynb`](colab_labeling.ipynb) in Colab. It pins `source/` to the
+local commits, keeps the label cache on Google Drive, and runs the gold-set check
+before the full run. Labels from a different model do not reuse cached ones
+(the model name is part of the cache key).
 
 Each output record has a `source`:
 - `auto` — certain negatives labeled without the LLM: tests, mocks, vendored / generated code (`.pb.go`, `DO NOT EDIT` headers), binaries, assets, lock / build / lint files, CI

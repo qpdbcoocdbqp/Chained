@@ -39,6 +39,7 @@ import subprocess
 import sys
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -472,7 +473,7 @@ def _load_cache(cache_path: str | None) -> dict[str, dict]:
 def _label_via_llm(
     repo_dir: Path, files: list[str], all_files: list[str], base_url: str, model: str,
     api_key: str, batch_size: int, with_content: bool, cache: dict[str, dict],
-    cache_path: str | None, verify: bool = True,
+    cache_path: str | None, verify: bool = True, workers: int = 1,
 ) -> dict[str, dict]:
     """Label `files` with the LLM, reusing and extending the on-disk cache.
     Returns path → {label, reason}; files the LLM never labeled are absent."""
@@ -496,14 +497,21 @@ def _label_via_llm(
 
     context = _repo_context(repo_dir, all_files)
     dir_stats = dir_ext_stats(all_files)
+    batches = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
+    # One RNG per batch, drawn up front, so the verification filler does not
+    # depend on the order in which parallel batches finish.
+    batch_rngs = [random.Random(rng.random()) for _ in batches]
     cache_f = open(cache_path, "a", encoding="utf-8") if cache_path else None
+    # Batches run concurrently (--workers) so a batching server such as vLLM
+    # stays busy; cache writes stay on this thread.
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
     try:
-        n_batches = (len(todo) + batch_size - 1) // batch_size
-        for b, i in enumerate(range(0, len(todo), batch_size), 1):
-            batch = todo[i:i + batch_size]
-            print(f"   batch {b}/{n_batches} ({len(batch)} files)...", flush=True)
-            labels = label_and_verify(repo_dir, context, batch, with_content, base_url, model,
-                                      api_key, dir_stats, rng, verify)
+        futures = [pool.submit(label_and_verify, repo_dir, context, batch, with_content, base_url,
+                               model, api_key, dir_stats, batch_rng, verify)
+                   for batch, batch_rng in zip(batches, batch_rngs)]
+        for b, fut in enumerate(as_completed(futures), 1):
+            labels = fut.result()
+            print(f"   batch {b}/{len(batches)} done ({len(labels)} labels)", flush=True)
             results.update(labels)
             if cache_f:
                 for path, lab in labels.items():
@@ -512,6 +520,7 @@ def _label_via_llm(
                     cache_f.write(json.dumps({"key": key, **lab}, ensure_ascii=False) + "\n")
                 cache_f.flush()   # keep progress if the run is interrupted
     finally:
+        pool.shutdown(cancel_futures=True)
         if cache_f:
             cache_f.close()
     return results
@@ -622,7 +631,8 @@ def _rule_label(rule_score: float, threshold: float = 0.45) -> int:
 
 def generate(root_dir: str, output_path: str, batch_size: int, rule_only: bool,
              with_content: bool = True, max_llm_files: int | None = None,
-             cache_path: str | None = None, seed: int = 42, verify: bool = True):
+             cache_path: str | None = None, seed: int = 42, verify: bool = True,
+             workers: int = 1):
     root = Path(root_dir).expanduser().resolve()
     if not root.exists():
         print(f"❌ Root not found: {root}", file=sys.stderr)
@@ -669,7 +679,8 @@ def generate(root_dir: str, output_path: str, batch_size: int, rule_only: bool,
                                              features_map, max_llm_files, seed)
                 print(f"   {len(auto_neg)} auto-negative, {len(candidates)} sent to LLM")
                 llm_labels = _label_via_llm(repo_dir, candidates, files, base_url, model, api_key,
-                                            batch_size, with_content, cache, cache_path, verify)
+                                            batch_size, with_content, cache, cache_path, verify,
+                                            workers)
 
             # Write one JSONL record per file
             for f in files:
@@ -778,10 +789,13 @@ def main():
                         help="Skip the second LLM pass that re-checks label-1 files")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for --max-llm-files sampling")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="LLM batches in flight at once (e.g. 8 for vLLM)")
     args = parser.parse_args()
     generate(args.root, args.output, args.batch_size, args.rule_only,
              with_content=not args.no_content, max_llm_files=args.max_llm_files,
-             cache_path=args.cache or None, seed=args.seed, verify=not args.no_verify)
+             cache_path=args.cache or None, seed=args.seed, verify=not args.no_verify,
+             workers=args.workers)
 
 
 if __name__ == "__main__":
