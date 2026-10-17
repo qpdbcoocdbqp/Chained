@@ -1,0 +1,189 @@
+# Settings for model/file_features.py (FeatureExtraction).
+# Names, directories and patterns are matched case-insensitively.
+# Changing anything that feeds rule_score or feature_columns requires
+# regenerating the training data and retraining the model.
+
+# Columns fed to the ML model, in order. extract() computes more than this
+# (they feed rule_score and collector.py's tie-breakers), but the other flags
+# either overfit to the training repos (in_src, in_*, ext_group_code, ...) or
+# add nothing beyond rule_score (ref_count, is_readme, is_public_api, ...) in
+# leave-one-repo-out evaluation.
+feature_columns:
+  - rule_score
+  - depth
+  - src_depth
+  - ext_group_other
+  - in_examples
+  - is_example_file
+  - is_dev_config
+  - is_internal_name
+  - is_public_api_name
+
+# ---------------------------------------------------------------------------
+# Extension groups (ext_group_*)
+# ---------------------------------------------------------------------------
+extensions:
+  # Matched against the end of the file name, before any other group
+  test: [.test.ts, .spec.ts, .test.js, .spec.js]
+  code: [.py, .go, .ts, .tsx, .js, .jsx, .rs, .java, .kt,
+         .cpp, .c, .h, .hpp, .cs, .swift, .rb, .php, .scala,
+         .clj, .ex, .exs, .lua, .r, .jl]
+  config: [.toml, .yaml, .yml, .json, .ini, .cfg, .conf, .env, .properties, .xml]
+  doc: [.md, .mdx, .rst, .txt, .adoc, .wiki]
+  data: [.csv, .tsv, .parquet, .arrow, .pkl, .bin, .so,
+         .dylib, .dll, .exe, .wasm, .zip, .tar, .gz,
+         .jpg, .jpeg, .png, .gif, .svg, .ico, .pdf, .lock]
+  # C/C++ headers; shallow ones under a public_header dir are public API
+  header: [.h, .hpp, .hh, .hxx]
+
+# ---------------------------------------------------------------------------
+# Directory sets. Each in_dirs key produces the feature in_<key> (1 when any
+# path component is in the set); a new key here is a new feature.
+# ---------------------------------------------------------------------------
+in_dirs:
+  docs: [docs, doc, documentation, wiki, guides, guide]
+  examples: [examples, example, samples, sample, demo, demos,
+             tutorials, tutorial, cookbook, notebooks, quickstart]
+  # Source dirs that contain public-facing code. include/ holds the public
+  # headers of C/C++ projects; client/ and sdk/ hold the user-facing SDK of
+  # server projects (e.g. milvus client/milvusclient).
+  src: [src, lib, pkg, source, app, cmd, api, include, client, clients, sdk]
+  # Clearly implementation internals
+  internal: [internal, internals, _internal, private, core, engine, backend]
+  tests: [test, tests, spec, specs, __tests__, e2e, integration, unit]
+  # CI / DevOps / tooling, developer-only. "tools" is deliberately absent:
+  # in many projects it holds the user-facing binaries (llama.cpp
+  # tools/server, tools/cli), so it is treated as neutral.
+  devops: [.github, .gitlab, .circleci, .travis, scripts, hack, contrib,
+           devtools, .devcontainer, ci, githooks, .husky]
+  # Noise: auto-generated, third-party, or build artifacts
+  ignored: [node_modules, vendor, .git, __pycache__, .venv, venv, .tox, dist,
+            build, target, .cache, .mypy_cache, .ruff_cache, coverage,
+            .pytest_cache, site-packages, eggs, .eggs, __mocks__, fixtures,
+            testdata, test_data, mock, mocks]
+  # Developer-internal code even when the file name looks neutral
+  util_dir: [utils, util, helpers, helper, base, bases, abstract, abstracts,
+             compat, shims, mixins, mixin, common, shared, support, lib_internal]
+  # Deployment / operations material. Partly user-facing for server projects
+  # (install via docker/binary) but mostly upgrade, migration, monitoring and
+  # log-export runbooks, so it gets a mild penalty rather than exclusion.
+  ops: [deployments, deployment, deploy, deploys, ops,
+        helm, charts, k8s, kubernetes, terraform, ansible]
+
+# Directory sets used inside other features; they produce no in_<key> feature
+helper_dirs:
+  # Directories whose shallow headers form a C/C++ library's public interface
+  public_header: [include]
+  # Directories holding a client SDK; their shallow code is what users call
+  sdk: [client, clients, sdk, sdks]
+  # Sub-directories of docs/ written for maintainers rather than users:
+  # design records, contributor guides, guides for coding agents
+  maintainer_docs: [design-docs, design_docs, design, designs,
+                    developer_guides, developer-guides, developer, development,
+                    dev, contributing, internals, rfc, rfcs, adr, adrs,
+                    proposals, agent_guides, agents]
+
+# src_depth is the depth below the first of these found in the path,
+# checked in this order
+src_depth_anchors: [src, lib, pkg, source, app, cmd, api, include, client,
+                    clients, sdk, examples, example, docs, doc]
+
+# ---------------------------------------------------------------------------
+# File names
+# ---------------------------------------------------------------------------
+names:
+  # Files a user imports directly: package surface, crate root, module entry,
+  # Go package overview
+  public_api: [__init__.py, mod.rs, lib.rs, index.ts, index.js, doc.go]
+  # CLI entry points users actually run
+  cli: [__main__.py, cli.py, cli.go, cli.ts,
+        main.py, main.go, main.ts, main.rs, main.js,
+        app.py, app.go, app.ts]
+  # Manifests a user reads to install the project; counted at the repo root only
+  user_config: [pyproject.toml, setup.py, setup.cfg, go.mod, cargo.toml,
+                package.json, requirements.txt, .env.example]
+  # Build, CI and lint config; users don't need these
+  dev_config: [go.sum, package-lock.json, yarn.lock, poetry.lock, pipfile.lock,
+               makefile, cmake, dockerfile, docker-compose.yml, docker-compose.yaml,
+               .eslintrc, .eslintrc.js, .eslintrc.json, .eslintrc.yml,
+               .prettierrc, .prettierrc.js, .prettierrc.json,
+               .babelrc, babel.config.js, babel.config.json,
+               jest.config.js, jest.config.ts, vitest.config.ts,
+               webpack.config.js, vite.config.ts, rollup.config.js,
+               .flake8, .pylintrc, mypy.ini, ruff.toml,
+               .gitignore, .gitattributes, .editorconfig,
+               codecov.yml, sonar-project.properties,
+               composer.json, build.gradle, pom.xml, cmakelists.txt]
+
+# ---------------------------------------------------------------------------
+# Regex patterns (case-insensitive). A list is joined into one alternation.
+# ---------------------------------------------------------------------------
+patterns:
+  # Dependency manifests with a doc-like extension (.txt) that are config
+  manifest: '^(requirements|constraints)([-_.][\w.-]+)?\.(txt|in)$'
+  readme: 'readme|getting.?started|quickstart'
+  test: '(^|[_\-])test[s]?([_\-.]|$)|(^|[_\-])spec([_\-.]|$)'
+  example: '(example|sample|demo|tutorial|cookbook|howto|usage)'
+  # File stems that signal internal / helper code
+  internal_name:
+    - '^_[^_]'                            # single leading _ (Python private)
+    - 'util[s]?$'
+    - 'helper[s]?$'
+    - 'mixin[s]?'
+    - 'abstract_|_abstract|^abstract'     # abstract base classes
+    - '^base_|_base$|^base\b'             # base classes
+    - '_impl$|_internal$'
+    - 'compat$|shim[s]?$'
+    - 'constant[s]?$|const[s]?$'
+    - 'exception[s]?$|error[s]?$'
+    - 'migration[s]?$|schema[s]?$'
+  # File stems that signal user-facing API code
+  public_api_name:
+    - 'client|sdk|api|interface'
+    - 'model[s]?|type[s]?'                # public data models / types
+    - 'handler[s]?|route[s]?'
+    - 'plugin[s]?|extension[s]?'
+    - 'command[s]?|action[s]?'
+
+# ---------------------------------------------------------------------------
+# Rule-based score in [0, 1], user perspective
+# ---------------------------------------------------------------------------
+rule_score:
+  # Base score by content type. Code needs other signals to go high; most
+  # configs are dev-facing; docs tend to be user-facing by default.
+  group_base: {code: 0.35, config: 0.20, doc: 0.55, data: 0.05, test: 0.05, other: 0.05}
+
+  # The strongest positive signal counts in full, the rest are multiplied by
+  # this. Plain summation saturated at 1.0 for every examples/*/README.md,
+  # leaving no room to rank them against each other or the root README.
+  secondary_positive_factor: 0.3
+  positive:
+    readme_root: 0.40          # root README = project overview
+    readme_nested: 0.25
+    in_examples: 0.35          # shows users HOW to use the library
+    is_example_file: 0.25      # demo/sample in the file name
+    is_public_api: 0.30        # __init__.py / index.ts / include/*.h
+    is_cli_entry: 0.25         # users invoke this directly
+    in_docs: 0.25
+    is_user_config: 0.20       # needed to install / configure
+    is_public_api_name: 0.15   # "client", "sdk", "api" in the name
+    src_depth_0: 0.20          # e.g. src/client.py
+    src_depth_1: 0.10          # e.g. src/auth/token.py
+    root_script: 0.20          # top-level scripts users run (convert_hf_to_gguf.py)
+
+  # Applied in this order; each weight is multiplied by its signal (1 for a
+  # flag, the directory level for depth)
+  penalty:
+    in_tests: 0.35
+    is_test_file: 0.30
+    in_devops: 0.30
+    is_dev_config: 0.25
+    in_internal: 0.20
+    is_private_module: 0.20
+    is_internal_name: 0.15
+    in_util_dir: 0.15
+    in_maintainer_docs: 0.30   # design records / contributor guides
+    in_ops: 0.15               # deployment / upgrade / migration runbooks
+    non_user_config: 0.10      # config files other than user manifests
+    depth: 0.04                # per directory level: deep files are mostly implementation details
+    deep_src: 0.16             # src_depth >= 3, on top of the depth penalty

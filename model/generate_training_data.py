@@ -9,22 +9,19 @@ For each repository under --root, this script:
      the LLM ("auto"), then sends the remaining files — with a content snippet
      and repo context — in batches to the local LLM ("llm").  Labels are cached
      per prompt version, so feature changes do not require relabeling.
-  4. Writes one JSONL record per file:
+  4. Writes one JSONL record per labeled file:
        {"path": "src/api.py", "label": 1, "source": "llm", "features": {...}, ...}
 
-The JSONL output is then consumed by train_ml_scorer.py; train on
-`--sources llm,auto` — "rule" labels are derived from the rule_score feature.
+The prompt and the category → label table live in prompt.yaml.  The JSONL
+output is consumed by train_ml_scorer.py.
 
 Usage:
     python3 generate_training_data.py \\
         --root /path/to/repos \\
         --output training_data.jsonl \\
-        [--batch-size 20] \\
-        [--max-llm-files 600]  # per-repo cap on LLM-labeled files
-        [--no-content]         # send paths only
-        [--rule-only]          # skip LLM, label using rule_score threshold instead
+        [--batch-size 20] [--workers 8]
 
-Environment variables:
+Environment variables (required):
     LOCAL_LLM_BASE_URL   e.g. http://localhost:1234/v1
     LOCAL_LLM_MODEL      e.g. qwen2.5-coder-7b-instruct
     LOCAL_LLM_API_KEY    e.g. lm-studio
@@ -37,20 +34,24 @@ import random
 import re
 import subprocess
 import sys
-import urllib.request
-import urllib.error
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import openai
+import yaml
 from dotenv import load_dotenv
 load_dotenv()
 
 from filescore import SKIP_EXTS, SKIP_NAMES
-from model.file_features import extract_features, _IGNORE_DIRS, _TEST_PATTERN, build_ref_counts
+from model.file_features import extract_features, features
 
-# ---------------------------------------------------------------------------
-# File listing
-# ---------------------------------------------------------------------------
+PROMPT = yaml.safe_load(Path(__file__).with_name("prompt.yaml").read_text(encoding="utf-8"))
+PROMPT_VERSION: str = PROMPT["version"]
+CATEGORIES: dict[str, int] = {name: c["label"] for name, c in PROMPT["categories"].items()}
+SYSTEM_PROMPT: str = PROMPT["system"].replace("{categories}", "\n".join(
+    f"- {name} — {c['desc']}" for name, c in PROMPT["categories"].items()))
+
 
 def list_repo_files(repo_root: Path) -> list[str]:
     """
@@ -58,118 +59,24 @@ def list_repo_files(repo_root: Path) -> list[str]:
     respects .gitignore automatically); falls back to a recursive walk that
     manually skips common noise directories.
     """
-    git_dir = repo_root / ".git"
-    if git_dir.exists():
+    if (repo_root / ".git").exists():
         try:
-            out = subprocess.check_output(
-                ["git", "ls-files"],
-                cwd=repo_root,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
+            out = subprocess.check_output(["git", "ls-files"], cwd=repo_root,
+                                          stderr=subprocess.DEVNULL, text=True)
             files = [l.strip() for l in out.splitlines() if l.strip()]
             if files:
                 return files
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass  # git not available or not a proper repo, fall through
 
-    # Plain recursive walk — skip obvious noise
-    files = []
-    for p in repo_root.rglob("*"):
-        if not p.is_file():
-            continue
-        parts_lower = [part.lower() for part in p.relative_to(repo_root).parts]
-        if any(part in _IGNORE_DIRS for part in parts_lower):
-            continue
-        files.append(str(p.relative_to(repo_root)))
-    return sorted(files)
+    return sorted(str(p.relative_to(repo_root)) for p in repo_root.rglob("*")
+                  if p.is_file() and not features.dirs["ignored"]
+                  & {part.lower() for part in p.relative_to(repo_root).parts})
 
 
 # ---------------------------------------------------------------------------
-# LLM labeling
+# Content snippets
 # ---------------------------------------------------------------------------
-
-# Bump whenever _SYSTEM_PROMPT, CATEGORIES or the per-file context changes
-# meaningfully: cached labels are only reused for the same version.
-PROMPT_VERSION = "v9"
-
-# The LLM only classifies each file into one of these categories; the label is
-# derived here.  Asking for 0/1 directly let the model trade an include rule
-# off against an exclude rule ("doc.go is an entry point" vs "internal support
-# library") and pick 1 — a fixed category → label table enforces the policy.
-CATEGORIES: dict[str, tuple[int, str]] = {
-    # --- label 1 ---------------------------------------------------------
-    "user_doc":         (1, "README, getting started, install / build instructions, user guide, "
-                            "tutorial, FAQ, troubleshooting, docs of CLI tools / server endpoints / "
-                            "config options, guide for migrating user code between versions"),
-    "example_main":     (1, "the main program or README of an example / demo / sample notebook, "
-                            "Go *_example_test.go"),
-    "api_entry":        (1, "entry point of the PUBLIC library / SDK users import: headers in the "
-                            "library's public include/ dir, __init__.py / doc.go / index.ts of the "
-                            "public package, the SDK client constructor and its main operations "
-                            "files (collections, search, insert ...)"),
-    "user_script":      (1, "a script users run directly, located at the repo root "
-                            "(e.g. convert_hf_to_gguf.py)"),
-    "install_manifest": (1, "ROOT-level pyproject.toml / package.json / go.mod / requirements.txt, "
-                            "or a documented example configuration file"),
-    # --- label 0 ---------------------------------------------------------
-    "per_variant_impl": (0, "one of many sibling files each implementing one model / backend / "
-                            "index type / data type / operator (conversion/llama.py, index/hnsw.go, "
-                            "src/models/qwen.cpp, ggml-cuda/*.cu)"),
-    "sdk_internal":     (0, "SDK file that is not its main entry: option builders (*_options), "
-                            "type / entity / column definitions, conversion, serialization, minor "
-                            "or administrative operations"),
-    "internal_impl":    (0, "implementation: backends, kernels, server internals, internal/ pkg/ "
-                            "core/ packages of a server, helpers, headers next to the implementation "
-                            "(src/*.h) — even when widely imported"),
-    "tool_impl":        (0, "implementation source of a CLI tool or server (tools/x/x.cpp)"),
-    "ui_source":        (0, "web / mobile / desktop app source: components, pages, stores, "
-                            "services, utils, type definitions"),
-    "example_aux":      (0, "anything in an example other than its main program / README: build "
-                            "and project files, resources, helper headers, secondary source files"),
-    "maintainer_doc":   (0, "design docs, architecture / data-flow docs, RFCs, ADRs, contributor or "
-                            "developer guides, guides for coding agents, release process"),
-    "ops_runbook":      (0, "operating a deployment: cluster upgrade, metadata / storage migration, "
-                            "log export, monitoring / dashboards setup"),
-    "support_lib":      (0, "code or docs of an internal support library (logging, errors, metrics, "
-                            "tracing) of a server, including its doc.go / README"),
-    "test_build_ci":    (0, "tests, mocks, fixtures, benchmarks, CI/CD, build scripts, linters, "
-                            "nested manifests — but NOT Go *_example_test.go, which is example_main"),
-    "asset_generated":  (0, "generated, vendored, binary, data, asset or template files "
-                            "(e.g. chat-template .jinja), placeholders, near-empty files"),
-}
-
-_SYSTEM_PROMPT = """
-You classify files of a software repository for building a USER CHEATSHEET: a
-compact reference telling a new user what the project does, how to install
-it, and how to use it (commands, APIs, configuration).
-
-Put every file into exactly ONE category:
-
-{categories}
-
-Rules:
-- When a file fits both an include category (user_doc, example_main,
-  api_entry, user_script, install_manifest) and an exclude category, the
-  EXCLUDE category wins.  Examples: doc.go of a server's logging package is
-  support_lib; *_options.go of an SDK is sdk_internal; a grafana setup README
-  is ops_runbook; a UI data-flow doc is maintainer_doc.
-- Use the facts after each path: "repo root" vs a nested path decides
-  user_script; "1 of N <ext> files in <dir>/" with a large N usually means
-  per_variant_impl.
-- First decide what kind of project this is from the repo context.  For a
-  LIBRARY its exported entry points are api_entry.  For a SERVER or
-  APPLICATION, users go through its client SDK, CLI, configuration and network
-  API; the server's own packages are internal_impl or support_lib.
-- When a content snippet is given, judge by the content; the path alone can
-  mislead (a docs/ file may be a design record, a README may be a stub).
-- Judge every file independently, not by analogy with its neighbours.
-- Expect only about 5-15% of files in include categories.  When unsure
-  between an include and an exclude category, choose the exclude one.
-
-Respond with ONLY a JSON array with one object per input item, in input order:
-[{{"i": <item number>, "category": "<category>", "reason": "<at most 15 words>"}}]
-""".format(categories="\n".join(f"- {name} — {desc}" for name, (_, desc) in CATEGORIES.items()))
 
 SNIPPET_CHARS = 400          # per-file content excerpt sent to the LLM
 README_CONTEXT_CHARS = 1500  # repo README excerpt included in every batch
@@ -215,77 +122,9 @@ def _read_snippet(repo_dir: Path, rel: str, limit: int) -> str | None:
     return text[:limit]
 
 
-def _repo_context(repo_dir: Path, files: list[str]) -> str:
-    """Repo-level context shared by every batch: name, top-level layout and
-    the start of the README, so the LLM knows what kind of project it is."""
-    top = sorted({f.replace("\\", "/").split("/")[0] + ("/" if "/" in f.replace("\\", "/") else "")
-                  for f in files})
-    readme = next((f for f in files if f.lower() in ("readme.md", "readme.rst", "readme.txt", "readme")), None)
-    parts = [f"Repository: {repo_dir.name}",
-             "Top-level entries: " + ", ".join(top[:60])]
-    if readme:
-        excerpt = _read_snippet(repo_dir, readme, README_CONTEXT_CHARS)
-        if excerpt:
-            parts.append(f"README excerpt:\n{excerpt}")
-    return "\n".join(parts)
-
-
-def dir_ext_stats(all_files: list[str]) -> dict[str, dict[str, int]]:
-    """dir → {extension: file count}, for the per-file location facts.
-    Test files are not counted: 93 .go files in milvusclient/ are mostly
-    *_test.go and would make the SDK entry look like one variant of many."""
-    stats: dict[str, dict[str, int]] = {}
-    for f in all_files:
-        d, _, name = f.replace("\\", "/").rpartition("/")
-        if _TEST_PATTERN.search(Path(name).stem.lower()):
-            continue
-        ext = Path(name).suffix.lower()
-        stats.setdefault(d, {})
-        stats[d][ext] = stats[d].get(ext, 0) + 1
-    return stats
-
-
-_MAINTAINER_DOC_PATH = re.compile(
-    r"(^|/)docs?/(.+/)?(design[-_]?docs?|designs?|architecture|flows|rfcs?|adrs?|"
-    r"development|developer[-_]guides?|internals)/", re.I)
-
-
-def _location_fact(rel: str, dir_stats: dict[str, dict[str, int]] | None) -> str:
-    """Objective placement facts the model otherwise guesses wrong: whether a
-    script is at the repo root, and how many same-type siblings it has
-    (one of 45 .py files in conversion/ is a per-variant implementation)."""
-    d, _, name = rel.replace("\\", "/").rpartition("/")
-    if not d:
-        return "repo root"
-    ext = Path(name).suffix.lower()
-    n = (dir_stats or {}).get(d, {}).get(ext, 0)
-    fact = f"1 of {n} {ext or 'extensionless'} files in {d}/" if n > 1 else f"in {d}/"
-    m = _MAINTAINER_DOC_PATH.search(rel.replace("\\", "/"))
-    if m:
-        fact += f"; inside a '{m.group(3)}' docs directory, which is written for maintainers"
-    return fact
-
-
-def _format_batch(repo_dir: Path, batch: list[str], with_content: bool,
-                  dir_stats: dict[str, dict[str, int]] | None = None) -> str:
-    lines = []
-    for i, rel in enumerate(batch, 1):
-        try:
-            size_kb = (repo_dir / rel).stat().st_size / 1024
-            size = f"{size_kb:.1f} KB"
-        except OSError:
-            size = "?"
-        lines.append(f"[{i}] {rel} ({size}; {_location_fact(rel, dir_stats)})")
-        if with_content:
-            snippet = _read_snippet(repo_dir, rel, SNIPPET_CHARS)
-            if snippet is None:
-                lines.append("    <binary or unreadable>")
-            elif not snippet:
-                lines.append("    <empty>")
-            else:
-                lines.append("    " + snippet.replace("\n", "\n    "))
-    return "\n".join(lines)
-
+# ---------------------------------------------------------------------------
+# LLM labeling
+# ---------------------------------------------------------------------------
 
 _ITEM_PATTERN = re.compile(r'"i"\s*:\s*"?(\d+)"?\s*,\s*"category"\s*:\s*"([a-z_]+)"')
 LLM_DEBUG_LOG = Path("model/tmp/llm_failed_replies.log")
@@ -324,206 +163,294 @@ def _extract_json_array(raw: str):
     raise RuntimeError(f"LLM reply has no parseable labels: {first}")
 
 
-def _call_llm(context: str, batch_text: str, base_url: str, model: str, api_key: str) -> list:
-    """Send one batch to an OpenAI-compatible chat endpoint and parse the reply."""
-    user_msg = f"{context}\n\nFiles to classify:\n{batch_text}"
-    body = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user",   "content": user_msg},
-        ],
-        "temperature": 0.0,  # deterministic output for reproducible labels
-        "max_tokens": 8192,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        base_url.rstrip("/") + "/chat/completions",
-        data=body,
-        headers={
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise RuntimeError(f"LLM request failed: {e}") from e
-
-    return _extract_json_array(payload["choices"][0]["message"]["content"])
+def llm_from_env() -> tuple[openai.OpenAI, str]:
+    """Client for the OpenAI-compatible endpoint (vLLM, LM Studio, ...) in
+    LOCAL_LLM_BASE_URL, and the model name."""
+    base_url = os.environ.get("LOCAL_LLM_BASE_URL", "").strip()
+    if not base_url:
+        sys.exit("❌ LOCAL_LLM_BASE_URL is not set")
+    client = openai.OpenAI(base_url=base_url, api_key=os.environ.get("LOCAL_LLM_API_KEY", "not-needed"),
+                           timeout=300)
+    return client, os.environ.get("LOCAL_LLM_MODEL", "gpt-3.5-turbo")
 
 
+_MAINTAINER_DOC_PATH = re.compile(
+    r"(^|/)docs?/(.+/)?(design[-_]?docs?|designs?|architecture|flows|rfcs?|adrs?|"
+    r"development|developer[-_]guides?|internals)/", re.I)
 _EXAMPLE_README = re.compile(r"(^|/)(examples?|samples?|demos?)/[^/]+/readme[^/]*$", re.I)
+_ROOT_COMPOSE = re.compile(r"^docker-compose[\w.-]*\.ya?ml$", re.I)
+_CONFIG_EXAMPLE = re.compile(r"(^|/)configs?/[^/]+\.(ya?ml|toml|json|ini|conf)$", re.I)
+VERIFY_MIN_FILLER = 4   # negatives mixed into a verification batch
+VOTE_MIN_FILES = 10     # directory size for the per_variant_impl majority vote
 
 
-def _policy_override(rel: str, category: str) -> str:
+def policy_override(rel: str, category: str) -> str:
     """Policies decidable from the path alone, which the model applies
     inconsistently across batches.  Content judgements stay with the model."""
     norm = rel.replace("\\", "/")
+    name = norm.rpartition("/")[2].lower()
     # godoc runnable examples look like tests but are usage documentation
-    if category == "test_build_ci" and norm.lower().endswith("example_test.go"):
+    if category == "test_build_ci" and name.endswith("example_test.go"):
         return "example_main"
     # the README of examples/<name>/ is that example's main document
-    if category == "example_aux" and _EXAMPLE_README.search(norm):
+    if _EXAMPLE_README.search(norm):
         return "example_main"
+    # protobuf schemas are a server's internal RPC definitions; users go
+    # through the client SDK (the model called 15 of milvus pkg/proto api_entry)
+    if name.endswith(".proto") and CATEGORIES[category]:
+        return "internal_impl"
+    # install_manifest as prompt.yaml defines it: a root-level manifest or an
+    # example configuration under configs/.  The model also gave it to
+    # .devops/ Dockerfiles, nix files, nested requirements and cmake templates.
+    if category == "install_manifest" and not (
+            ("/" not in norm and (name in features.names["user_config"] or _ROOT_COMPOSE.match(name)))
+            or _CONFIG_EXAMPLE.search(norm)):
+        return "user_doc" if name.startswith("readme") else "test_build_ci"
     return category
 
 
-def _label_batch(repo_dir: Path, context: str, batch: list[str], with_content: bool,
-                 base_url: str, model: str, api_key: str,
-                 dir_stats: dict[str, dict[str, int]] | None = None) -> dict[str, dict]:
-    """Label one batch.  Items are referenced by number rather than path so
-    that a model rewriting a path (slashes, ./ prefix) cannot drop a label.
-    The model returns a category; the label comes from CATEGORIES.
-    On failure the batch is split in half and retried, down to single files."""
-    def again(sub):
-        return _label_batch(repo_dir, context, sub, with_content, base_url, model, api_key, dir_stats)
+class RepoLabeler:
+    """Labels files of one repo with the LLM.
 
-    try:
-        items = _call_llm(context, _format_batch(repo_dir, batch, with_content, dir_stats),
-                          base_url, model, api_key)
-    except RuntimeError as e:
-        if len(batch) == 1:
-            print(f"    ⚠️ giving up on {batch[0]}: {e}", file=sys.stderr)
-            return {}
-        print(f"    ⚠️ batch of {len(batch)} failed ({str(e).splitlines()[0]}); splitting",
-              file=sys.stderr)
-        mid = len(batch) // 2
-        return {**again(batch[:mid]), **again(batch[mid:])}
+    Every batch carries the same repo context (name, top-level layout, README
+    excerpt) so the LLM knows what kind of project it is, and per-file
+    location facts computed from all files of the repo.
+    """
 
-    labels = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            idx = int(item.get("i"))
-        except (TypeError, ValueError):
-            continue
-        category = str(item.get("category", "")).strip().lower()
-        if 1 <= idx <= len(batch) and category in CATEGORIES:
-            category = _policy_override(batch[idx - 1], category)
-            labels[batch[idx - 1]] = {"label": CATEGORIES[category][0], "category": category,
-                                      "reason": str(item.get("reason", ""))}
-    missing = [f for f in batch if f not in labels]
-    if missing and len(missing) < len(batch):
-        # Model skipped some items or invented a category — ask again for those
-        labels.update(again(missing))
-    return labels
+    def __init__(self, repo_dir: Path, all_files: list[str], client: openai.OpenAI, model: str,
+                 verify: bool = True):
+        self.repo_dir, self.client, self.model, self.verify = repo_dir, client, model, verify
+        self.context = self._repo_context(all_files)
+        self.dir_stats = self._dir_ext_stats(all_files)
 
+    def _repo_context(self, files: list[str]) -> str:
+        top = sorted({f.replace("\\", "/").split("/")[0] + ("/" if "/" in f.replace("\\", "/") else "")
+                      for f in files})
+        readme = next((f for f in files if f.lower() in ("readme.md", "readme.rst", "readme.txt", "readme")), None)
+        parts = [f"Repository: {self.repo_dir.name}", "Top-level entries: " + ", ".join(top[:60])]
+        excerpt = readme and _read_snippet(self.repo_dir, readme, README_CONTEXT_CHARS)
+        if excerpt:
+            parts.append(f"README excerpt:\n{excerpt}")
+        return "\n".join(parts)
 
-VERIFY_MIN_FILLER = 4   # negatives mixed into a verification batch
+    @staticmethod
+    def _dir_ext_stats(files: list[str]) -> dict[str, Counter]:
+        """dir → {extension: file count}, for the per-file location facts.
+        Test files are not counted: 93 .go files in milvusclient/ are mostly
+        *_test.go and would make the SDK entry look like one variant of many."""
+        stats: dict[str, Counter] = {}
+        for f in files:
+            d, _, name = f.replace("\\", "/").rpartition("/")
+            if not features.patterns["test"].search(Path(name).stem.lower()):
+                stats.setdefault(d, Counter())[Path(name).suffix.lower()] += 1
+        return stats
 
+    def location_fact(self, rel: str) -> str:
+        """Objective placement facts the model otherwise guesses wrong: whether a
+        script is at the repo root, and how many same-type siblings it has
+        (one of 45 .py files in conversion/ is a per-variant implementation)."""
+        d, _, name = rel.replace("\\", "/").rpartition("/")
+        if not d:
+            return "repo root"
+        ext = Path(name).suffix.lower()
+        n = self.dir_stats.get(d, {}).get(ext, 0)
+        fact = f"1 of {n} {ext or 'extensionless'} files in {d}/" if n > 1 else f"in {d}/"
+        m = _MAINTAINER_DOC_PATH.search(rel.replace("\\", "/"))
+        if m:
+            fact += f"; inside a '{m.group(3)}' docs directory, which is written for maintainers"
+        return fact
 
-def label_and_verify(repo_dir: Path, context: str, batch: list[str], with_content: bool,
-                     base_url: str, model: str, api_key: str,
-                     dir_stats: dict[str, dict[str, int]] | None, rng: random.Random,
-                     verify: bool = True) -> dict[str, dict]:
-    """Label a batch, then re-label its positives once more in a different mix
-    and keep label 1 only when both passes agree.
-
-    Errors are almost all false positives that flip with batch composition
-    (a maintainer guide called user_doc next to real user docs), so a second,
-    differently-composed look at the ~10% positives buys precision cheaply.
-    Negatives from the batch are mixed in as filler so the verifier does not
-    see a list made only of plausible files."""
-    labels = _label_batch(repo_dir, context, batch, with_content, base_url, model, api_key, dir_stats)
-    positives = [f for f, lab in labels.items() if lab["label"] == 1]
-    if not verify or not positives:
-        return labels
-    negatives = [f for f, lab in labels.items() if lab["label"] == 0]
-    filler = rng.sample(negatives, min(len(negatives), max(VERIFY_MIN_FILLER, len(positives))))
-    check = positives + filler
-    rng.shuffle(check)
-    second = _label_batch(repo_dir, context, check, with_content, base_url, model, api_key, dir_stats)
-    for f in positives:
-        lab2 = second.get(f)
-        if lab2 is not None and lab2["label"] == 0:
-            first_cat = labels[f]["category"]
-            labels[f] = {**lab2, "reason": f"[verify: {first_cat} -> {lab2['category']}] {lab2['reason']}"}
-    return labels
-
-
-# ---------------------------------------------------------------------------
-# Label cache — labels depend on the prompt and model, not on file_features,
-# so feature changes can be retrained without relabeling.
-# ---------------------------------------------------------------------------
-
-def _cache_key(repo: str, path: str, model: str, with_content: bool, verify: bool) -> str:
-    return "\t".join([repo, path.replace("\\", "/"), PROMPT_VERSION, model,
-                      str(int(with_content)), "verify" if verify else "single"])
-
-
-def _load_cache(cache_path: str | None) -> dict[str, dict]:
-    cache: dict[str, dict] = {}
-    if not cache_path or not Path(cache_path).exists():
-        return cache
-    with open(cache_path, encoding="utf-8") as f:
-        for line in f:
+    def format_batch(self, batch: list[str]) -> str:
+        lines = []
+        for i, rel in enumerate(batch, 1):
             try:
-                r = json.loads(line)
-                cache[r["key"]] = {"label": r["label"], "category": r.get("category", ""),
-                                   "reason": r.get("reason", "")}
-            except (json.JSONDecodeError, KeyError):
+                size = f"{(self.repo_dir / rel).stat().st_size / 1024:.1f} KB"
+            except OSError:
+                size = "?"
+            lines.append(f"[{i}] {rel} ({size}; {self.location_fact(rel)})")
+            snippet = _read_snippet(self.repo_dir, rel, SNIPPET_CHARS)
+            lines.append("    <binary or unreadable>" if snippet is None else
+                         "    <empty>" if not snippet else
+                         "    " + snippet.replace("\n", "\n    "))
+        return "\n".join(lines)
+
+    def classify(self, batch: list[str]) -> list:
+        """Send one batch with the system prompt and parse the reply."""
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": PROMPT["user"].format(
+                        context=self.context, files=self.format_batch(batch))},
+                ],
+                **PROMPT["request"],
+            )
+        except openai.OpenAIError as e:
+            raise RuntimeError(f"LLM request failed: {e}") from e
+        return _extract_json_array(resp.choices[0].message.content or "")
+
+    def label_batch(self, batch: list[str]) -> dict[str, dict]:
+        """Label one batch.  Items are referenced by number rather than path so
+        that a model rewriting a path (slashes, ./ prefix) cannot drop a label.
+        The model returns a category; the label comes from CATEGORIES.
+        On failure the batch is split in half and retried, down to single files."""
+        try:
+            items = self.classify(batch)
+        except RuntimeError as e:
+            if len(batch) == 1:
+                print(f"    ⚠️ giving up on {batch[0]}: {e}", file=sys.stderr)
+                return {}
+            print(f"    ⚠️ batch of {len(batch)} failed ({str(e).splitlines()[0]}); splitting",
+                  file=sys.stderr)
+            mid = len(batch) // 2
+            return {**self.label_batch(batch[:mid]), **self.label_batch(batch[mid:])}
+
+        labels = {}
+        for item in items:
+            try:
+                idx = int(item.get("i"))
+            except (AttributeError, TypeError, ValueError):
                 continue
-    return cache
+            category = str(item.get("category", "")).strip().lower()
+            if 1 <= idx <= len(batch) and category in CATEGORIES:
+                category = policy_override(batch[idx - 1], category)
+                labels[batch[idx - 1]] = {"label": CATEGORIES[category], "category": category,
+                                          "reason": str(item.get("reason", ""))}
+        missing = [f for f in batch if f not in labels]
+        if missing and len(missing) < len(batch):
+            # Model skipped some items or invented a category — ask again for those
+            labels.update(self.label_batch(missing))
+        return labels
+
+    def label_and_verify(self, batch: list[str], rng: random.Random) -> dict[str, dict]:
+        """Label a batch, then re-label its positives once more in a different mix
+        and keep label 1 only when both passes agree.
+
+        Errors are almost all false positives that flip with batch composition
+        (a maintainer guide called user_doc next to real user docs), so a second,
+        differently-composed look at the ~10% positives buys precision cheaply.
+        Negatives from the batch are mixed in as filler so the verifier does not
+        see a list made only of plausible files."""
+        labels = self.label_batch(batch)
+        positives = [f for f, lab in labels.items() if lab["label"] == 1]
+        if not self.verify or not positives:
+            return labels
+        negatives = [f for f, lab in labels.items() if lab["label"] == 0]
+        check = positives + rng.sample(negatives, min(len(negatives), max(VERIFY_MIN_FILLER, len(positives))))
+        rng.shuffle(check)
+        second = self.label_batch(check)
+        for f in positives:
+            lab2 = second.get(f)
+            if lab2 is not None and lab2["label"] == 0:
+                labels[f] = {**lab2, "reason": f"[verify: {labels[f]['category']} -> {lab2['category']}] "
+                                               f"{lab2['reason']}"}
+        return labels
+
+    def label(self, files: list[str], cache: "LabelCache", batch_size: int,
+              workers: int = 1) -> dict[str, dict]:
+        """Label `files`, reusing and extending the cache.
+        Returns path → {label, category, reason}; files never labeled are absent."""
+        repo = self.repo_dir.name
+        results = {f: hit for f in files if (hit := cache.get(repo, f))}
+        todo = [f for f in files if f not in results]
+        print(f"   LLM labels: {len(results)} cached, {len(todo)} to label", flush=True)
+        if todo:
+            self._label_uncached(todo, results, cache, batch_size, workers)
+        return self.apply_policies(results)
+
+    @staticmethod
+    def apply_policies(labels: dict[str, dict]) -> dict[str, dict]:
+        """Re-apply policy_override (so cached labels follow the current rules)
+        and the per_variant_impl majority vote.  Changed labels get a
+        "[policy: old -> new]" prefix on the reason."""
+        def relabel(f: str, category: str) -> None:
+            lab = labels[f]
+            if category != lab["category"]:
+                labels[f] = {"label": CATEGORIES[category], "category": category,
+                             "reason": f"[policy: {lab['category']} -> {category}] {lab['reason']}"}
+
+        labels = dict(labels)
+        for f, lab in list(labels.items()):
+            relabel(f, policy_override(f, lab["category"]))
+
+        # The model sees ~20 of the 81 conversion/*.py at a time and calls some
+        # api_entry or example_main.  When it calls most files of a directory
+        # (same extension) per_variant_impl, its positives there are the slips.
+        groups: dict[tuple, list[str]] = {}
+        for f in labels:
+            d, _, name = f.replace("\\", "/").rpartition("/")
+            groups.setdefault((d, Path(name).suffix.lower()), []).append(f)
+        for fs in groups.values():
+            if (len(fs) >= VOTE_MIN_FILES and
+                    Counter(labels[f]["category"] for f in fs).most_common(1)[0][0] == "per_variant_impl"):
+                for f in fs:
+                    if labels[f]["label"] == 1:
+                        relabel(f, "per_variant_impl")
+        return labels
+
+    def _label_uncached(self, todo: list[str], results: dict[str, dict], cache: "LabelCache",
+                        batch_size: int, workers: int) -> None:
+        repo = self.repo_dir.name
+        # Mixed batches: path-sorted batches put 20 sibling files together and
+        # the model labels them by analogy instead of one by one.
+        rng = random.Random(f"{repo}:{PROMPT_VERSION}")
+        rng.shuffle(todo)
+        batches = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
+        # One RNG per batch, drawn up front, so the verification filler does not
+        # depend on the order in which parallel batches finish.
+        batch_rngs = [random.Random(rng.random()) for _ in batches]
+        # Batches run concurrently (--workers) so a batching server such as vLLM
+        # stays busy; cache writes stay on this thread.
+        pool = ThreadPoolExecutor(max_workers=max(1, workers))
+        try:
+            futures = [pool.submit(self.label_and_verify, b, r) for b, r in zip(batches, batch_rngs)]
+            for n, fut in enumerate(as_completed(futures), 1):
+                labels = fut.result()
+                print(f"   batch {n}/{len(batches)} done ({len(labels)} labels)", flush=True)
+                results.update(labels)
+                cache.add(repo, labels)
+        finally:
+            pool.shutdown(cancel_futures=True)
 
 
-def _label_via_llm(
-    repo_dir: Path, files: list[str], all_files: list[str], base_url: str, model: str,
-    api_key: str, batch_size: int, with_content: bool, cache: dict[str, dict],
-    cache_path: str | None, verify: bool = True, workers: int = 1,
-) -> dict[str, dict]:
-    """Label `files` with the LLM, reusing and extending the on-disk cache.
-    Returns path → {label, reason}; files the LLM never labeled are absent."""
-    repo = repo_dir.name
-    results = {}
-    todo = []
-    for f in files:
-        hit = cache.get(_cache_key(repo, f, model, with_content, verify))
-        if hit:
-            results[f] = hit
-        else:
-            todo.append(f)
-    print(f"   LLM labels: {len(results)} cached, {len(todo)} to label", flush=True)
-    if not todo:
-        return results
+class LabelCache:
+    """LLM labels on disk, keyed by repo, path, prompt version, model and the
+    verify flag.  Labels do not depend on file_features, so feature changes
+    can be retrained without relabeling."""
 
-    # Mixed batches: path-sorted batches put 20 sibling files together and
-    # the model labels them by analogy instead of one by one.
-    rng = random.Random(f"{repo}:{PROMPT_VERSION}")
-    rng.shuffle(todo)
+    def __init__(self, path: str | None, model: str, verify: bool):
+        self.path = path
+        # "1": content snippets were sent — kept so existing cache entries match
+        self._suffix = [PROMPT_VERSION, model, "1", "verify" if verify else "single"]
+        self._labels: dict[str, dict] = {}
+        if path and Path(path).exists():
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                        self._labels[r["key"]] = {"label": r["label"], "category": r.get("category", ""),
+                                                  "reason": r.get("reason", "")}
+                    except (json.JSONDecodeError, KeyError):
+                        continue
 
-    context = _repo_context(repo_dir, all_files)
-    dir_stats = dir_ext_stats(all_files)
-    batches = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
-    # One RNG per batch, drawn up front, so the verification filler does not
-    # depend on the order in which parallel batches finish.
-    batch_rngs = [random.Random(rng.random()) for _ in batches]
-    cache_f = open(cache_path, "a", encoding="utf-8") if cache_path else None
-    # Batches run concurrently (--workers) so a batching server such as vLLM
-    # stays busy; cache writes stay on this thread.
-    pool = ThreadPoolExecutor(max_workers=max(1, workers))
-    try:
-        futures = [pool.submit(label_and_verify, repo_dir, context, batch, with_content, base_url,
-                               model, api_key, dir_stats, batch_rng, verify)
-                   for batch, batch_rng in zip(batches, batch_rngs)]
-        for b, fut in enumerate(as_completed(futures), 1):
-            labels = fut.result()
-            print(f"   batch {b}/{len(batches)} done ({len(labels)} labels)", flush=True)
-            results.update(labels)
-            if cache_f:
-                for path, lab in labels.items():
-                    key = _cache_key(repo, path, model, with_content, verify)
-                    cache[key] = lab
-                    cache_f.write(json.dumps({"key": key, **lab}, ensure_ascii=False) + "\n")
-                cache_f.flush()   # keep progress if the run is interrupted
-    finally:
-        pool.shutdown(cancel_futures=True)
-        if cache_f:
-            cache_f.close()
-    return results
+    def key(self, repo: str, path: str) -> str:
+        return "\t".join([repo, path.replace("\\", "/"), *self._suffix])
+
+    def get(self, repo: str, path: str) -> dict | None:
+        return self._labels.get(self.key(repo, path))
+
+    def add(self, repo: str, labels: dict[str, dict]) -> None:
+        """Store labels, appending them to the file at once so an interrupted
+        run keeps its progress."""
+        lines = []
+        for path, lab in labels.items():
+            key = self.key(repo, path)
+            self._labels[key] = lab
+            lines.append(json.dumps({"key": key, **lab}, ensure_ascii=False) + "\n")
+        if self.path and lines:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.writelines(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -547,9 +474,9 @@ _GENERATED_MARKER = re.compile(
     r"do not (edit|modify)|@generated|"
     r"this (file|code) (is|was|has been) (automatically |auto-?)?generated|"
     r"(automatically|auto-?)generated (by|from|file|code)", re.I)
-
-
 _PREPROCESSOR = re.compile(r"^\s*#\s*(include|import|pragma|define|if|ifdef|ifndef|else|endif)\b")
+# Android resource dirs (res/values, res/mipmap-*, res/layout, ...)
+_ANDROID_RES = re.compile(r"(^|/)res/(values|mipmap|drawable|layout|xml)[^/]*/", re.I)
 
 
 def _has_generated_header(head: str) -> bool:
@@ -562,16 +489,13 @@ def _has_generated_header(head: str) -> bool:
         if _GENERATED_MARKER.search(stripped):
             return True
     return False
-# Android resource dirs (res/values, res/mipmap-*, res/layout, ...)
-_ANDROID_RES = re.compile(r"(^|/)res/(values|mipmap|drawable|layout|xml)[^/]*/", re.I)
 
 
-def _auto_negative(rel: str, feats: dict, repo_dir: Path | None = None) -> str | None:
+def auto_negative(rel: str, feats: dict, repo_dir: Path | None = None) -> str | None:
     """Reason string when a file is certainly not cheatsheet material, so it
     can be labeled without spending an LLM call; None otherwise."""
     p = Path(rel)
     name, ext = p.name.lower(), p.suffix.lower()
-    norm = rel.replace("\\", "/")
     if feats["in_ignored"]:
         return "vendored / generated / build-output path"
     if any(part.lower() in _VENDORED_DIRS for part in p.parts[:-1]):
@@ -580,7 +504,7 @@ def _auto_negative(rel: str, feats: dict, repo_dir: Path | None = None) -> str |
         return "build, lint or lock file"
     if ext in SKIP_EXTS or ext in _ASSET_EXTS or feats["ext_group_data"]:
         return "binary, asset or data file"
-    if _ANDROID_RES.search(norm):
+    if _ANDROID_RES.search(rel.replace("\\", "/")):
         return "mobile app resource file"
     if repo_dir is not None and _read_snippet(repo_dir, rel, 1) is None:
         return "binary file"
@@ -603,164 +527,54 @@ def _auto_negative(rel: str, feats: dict, repo_dir: Path | None = None) -> str |
     return None
 
 
-def _sample_for_llm(files: list[str], features_map: dict, limit: int | None, seed: int) -> list[str]:
-    """Cap the number of LLM-labeled files per repo.  Half the budget goes to
-    files the rules consider plausible (rule_score >= 0.3), where labels are
-    most informative; the rest is a random sample of everything else so the
-    model also learns where the rules are wrong in the other direction."""
-    if limit is None or len(files) <= limit:
-        return files
-    rng = random.Random(seed)
-    hi = [f for f in files if features_map[f]["rule_score"] >= 0.3]
-    lo = [f for f in files if features_map[f]["rule_score"] < 0.3]
-    rng.shuffle(hi)
-    rng.shuffle(lo)
-    take_hi = hi[: max(limit // 2, limit - len(lo))]
-    take_lo = lo[: limit - len(take_hi)]
-    return sorted(take_hi + take_lo)
-
-
-def _rule_label(rule_score: float, threshold: float = 0.45) -> int:
-    """Convert a rule score to a binary label using a threshold."""
-    return 1 if rule_score >= threshold else 0
-
-
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def generate(root_dir: str, output_path: str, batch_size: int, rule_only: bool,
-             with_content: bool = True, max_llm_files: int | None = None,
-             cache_path: str | None = None, seed: int = 42, verify: bool = True,
-             workers: int = 1):
+def generate(root_dir: str, output_path: str, batch_size: int, cache_path: str | None = None,
+             verify: bool = True, workers: int = 1):
     root = Path(root_dir).expanduser().resolve()
     if not root.exists():
-        print(f"❌ Root not found: {root}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(f"❌ Root not found: {root}")
 
-    # Collect all repo sub-directories (each direct child is treated as a repo)
-    repo_dirs = [d for d in sorted(root.iterdir()) if d.is_dir()
-                 and not d.name.startswith(".")]
-    if not repo_dirs:
-        # root itself might be a single repo
-        repo_dirs = [root]
+    # Each direct child is a repo; otherwise root itself is a single repo
+    repo_dirs = [d for d in sorted(root.iterdir()) if d.is_dir() and not d.name.startswith(".")] or [root]
+    client, model = llm_from_env()
+    cache = LabelCache(cache_path, model, verify)
 
-    base_url = os.environ.get("LOCAL_LLM_BASE_URL", "").strip()
-    model    = os.environ.get("LOCAL_LLM_MODEL", "gpt-3.5-turbo")
-    api_key  = os.environ.get("LOCAL_LLM_API_KEY", "not-needed")
-
-    use_llm = (not rule_only) and bool(base_url)
-    if not use_llm and not rule_only:
-        print("⚠️ LOCAL_LLM_BASE_URL not set — labeling with rule score only.\n"
-              "   Set LOCAL_LLM_BASE_URL or pass --rule-only to suppress this warning.",
-              file=sys.stderr)
-    cache = _load_cache(cache_path) if use_llm else {}
-
-    total_records = 0
-    with open(output_path, "w", encoding="utf-8") as out_f:
-        for repo_dir in repo_dirs:
-            repo_name = repo_dir.name
-            print(f"\n📂 Repo: {repo_name}")
-            files = list_repo_files(repo_dir)
-            print(f"   {len(files)} files found")
-            if not files:
-                continue
-
-            # Extract features for all files (with cross-file reference counts)
-            print(f"   Building reference counts...")
-            ref_counts = build_ref_counts(str(repo_dir), files)
-            features_map = {f: extract_features(f, ref_count=ref_counts.get(f, 0)) for f in files}
-
-            auto_neg: dict[str, str] = {}
-            llm_labels: dict[str, dict] = {}
-            if use_llm:
-                auto_neg = {f: r for f in files if (r := _auto_negative(f, features_map[f], repo_dir))}
-                candidates = _sample_for_llm([f for f in files if f not in auto_neg],
-                                             features_map, max_llm_files, seed)
-                print(f"   {len(auto_neg)} auto-negative, {len(candidates)} sent to LLM")
-                llm_labels = _label_via_llm(repo_dir, candidates, files, base_url, model, api_key,
-                                            batch_size, with_content, cache, cache_path, verify,
-                                            workers)
-
-            # Write one JSONL record per file
-            for f in files:
-                feats = features_map[f]
-                rule_sc = feats["rule_score"]
-
-                category = ""
-                if f in llm_labels:
-                    label    = llm_labels[f]["label"]
-                    reason   = llm_labels[f]["reason"]
-                    category = llm_labels[f].get("category", "")
-                    source   = "llm"
-                elif f in auto_neg:
-                    label  = 0
-                    reason = auto_neg[f]
-                    source = "auto"
-                else:
-                    # Train on LLM data with `--sources llm,auto`: rule labels
-                    # are a function of the rule_score feature (circular).
-                    label  = _rule_label(rule_sc)
-                    reason = f"rule_score={rule_sc:.3f}"
-                    source = "rule"
-
-                record = {
-                    "repo":       repo_name,
-                    "path":       f,
-                    "label":      label,
-                    "source":     source,    # "llm", "auto" or "rule"
-                    "reason":     reason,
-                    "category":   category,  # LLM category the label was derived from
-                    "rule_label": _rule_label(rule_sc),
-                    "features":   feats,
-                }
-                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                total_records += 1
-
-    print(f"\n✅ Training data written: {output_path} ({total_records} records)")
-    _print_stats(output_path)
-
-
-def _print_stats(output_path: str):
-    """Print a quick label distribution summary."""
-    counts = {"llm": {0: 0, 1: 0}, "rule": {0: 0, 1: 0}}
-    with open(output_path, encoding="utf-8") as f:
-        for line in f:
-            r = json.loads(line)
-            src = r.get("source", "rule")
-            lbl = r.get("label", 0)
-            counts.setdefault(src, {0: 0, 1: 0})[lbl] += 1
-
-    print("\n📊 Label distribution:")
-    for src, dist in counts.items():
-        total = dist[0] + dist[1]
-        if total == 0:
+    records = []
+    for repo_dir in repo_dirs:
+        print(f"\n📂 Repo: {repo_dir.name}")
+        files = list_repo_files(repo_dir)
+        print(f"   {len(files)} files found")
+        if not files:
             continue
-        pct = dist[1] / total * 100
-        print(f"  [{src}] include={dist[1]}  exclude={dist[0]}  "
-              f"include_rate={pct:.1f}%")
+        features_map = {f: extract_features(f) for f in files}
+        auto_neg = {f: r for f in files if (r := auto_negative(f, features_map[f], repo_dir))}
+        candidates = [f for f in files if f not in auto_neg]
+        print(f"   {len(auto_neg)} auto-negative, {len(candidates)} sent to LLM")
+        llm_labels = RepoLabeler(repo_dir, files, client, model, verify).label(
+            candidates, cache, batch_size, workers)
+        if len(llm_labels) < len(candidates):
+            print(f"   ⚠️ {len(candidates) - len(llm_labels)} files left unlabeled", file=sys.stderr)
 
-    # Where the LLM disagrees with the rules is exactly what the ML model can
-    # learn beyond rule_score — and a quick sanity check of the labels.
-    agree = {(a, b): 0 for a in (0, 1) for b in (0, 1)}
-    flips: dict[tuple, list] = {(0, 1): [], (1, 0): []}
-    with open(output_path, encoding="utf-8") as f:
-        for line in f:
-            r = json.loads(line)
-            if r.get("source") != "llm" or "rule_label" not in r:
-                continue
-            key = (r["rule_label"], r["label"])
-            agree[key] += 1
-            if key in flips:
-                flips[key].append(r["path"])
-    n = sum(agree.values())
-    if n:
-        print(f"\n🤝 LLM vs rule on {n} LLM-labeled files: "
-              f"agree={(agree[(0, 0)] + agree[(1, 1)]) / n * 100:.1f}%  "
-              f"rule0→llm1={agree[(0, 1)]}  rule1→llm0={agree[(1, 0)]}")
-        for (rl, ll), paths in flips.items():
-            if paths:
-                print(f"   e.g. rule={rl} llm={ll}: " + ", ".join(paths[:5]))
+        labels = {**{f: {"label": 0, "category": "", "reason": r, "source": "auto"} for f, r in auto_neg.items()},
+                  **{f: {**lab, "source": "llm"} for f, lab in llm_labels.items()}}
+        records += [{"repo": repo_dir.name, "path": f, "label": lab["label"], "source": lab["source"],
+                     "reason": lab["reason"],
+                     "category": lab.get("category", ""),   # LLM category the label was derived from
+                     "features": features_map[f]}
+                    for f in files if (lab := labels.get(f))]
+
+    with open(output_path, "w", encoding="utf-8") as out_f:
+        out_f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+    print(f"\n✅ Training data written: {output_path} ({len(records)} records)")
+    print("\n📊 Label distribution:")
+    for src in ("llm", "auto"):
+        dist = Counter(r["label"] for r in records if r["source"] == src)
+        if dist:
+            print(f"  [{src}] include={dist[1]}  exclude={dist[0]}  "
+                  f"include_rate={dist[1] / (dist[0] + dist[1]) * 100:.1f}%")
 
 
 # ---------------------------------------------------------------------------
@@ -768,34 +582,21 @@ def _print_stats(output_path: str):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Generate labeled training data for the ML file scorer"
-    )
-    parser.add_argument("--root",       required=True,
+    parser = argparse.ArgumentParser(description="Generate labeled training data for the ML file scorer")
+    parser.add_argument("--root", required=True,
                         help="Root folder containing one sub-directory per repo")
-    parser.add_argument("--output",     default="training_data.jsonl",
-                        help="Output JSONL file path")
+    parser.add_argument("--output", default="training_data.jsonl", help="Output JSONL file path")
     parser.add_argument("--batch-size", type=int, default=20,
                         help="Number of files sent to the LLM per request")
-    parser.add_argument("--rule-only",  action="store_true",
-                        help="Skip LLM; label using rule score threshold only")
-    parser.add_argument("--no-content", action="store_true",
-                        help="Send paths only, without per-file content snippets")
-    parser.add_argument("--max-llm-files", type=int, default=None,
-                        help="Per-repo cap on files sent to the LLM (stratified sample)")
     parser.add_argument("--cache", default="model/tmp/llm_label_cache.jsonl",
                         help="LLM label cache (reused across runs); '' to disable")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip the second LLM pass that re-checks label-1 files")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for --max-llm-files sampling")
     parser.add_argument("--workers", type=int, default=1,
                         help="LLM batches in flight at once (e.g. 8 for vLLM)")
     args = parser.parse_args()
-    generate(args.root, args.output, args.batch_size, args.rule_only,
-             with_content=not args.no_content, max_llm_files=args.max_llm_files,
-             cache_path=args.cache or None, seed=args.seed, verify=not args.no_verify,
-             workers=args.workers)
+    generate(args.root, args.output, args.batch_size, cache_path=args.cache or None,
+             verify=not args.no_verify, workers=args.workers)
 
 
 if __name__ == "__main__":

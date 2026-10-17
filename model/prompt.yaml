@@ -1,0 +1,147 @@
+# LLM labeling prompt for model/generate_training_data.py.
+#
+# Bump `version` whenever the system / user prompt, the categories or the
+# per-file facts (RepoLabeler.location_fact) change meaningfully: cached
+# labels are only reused for the same version.  Path policies
+# (policy_override, the per_variant_impl vote) are re-applied to cached labels.
+version: v9
+
+# The LLM only classifies each file into one of these categories; the label is
+# derived from this table. Asking for 0/1 directly let the model trade an
+# include rule off against an exclude rule ("doc.go is an entry point" vs
+# "internal support library") and pick 1 — a fixed category → label table
+# enforces the policy.
+categories:
+  # --- label 1 -------------------------------------------------------------
+  user_doc:
+    label: 1
+    desc: >-
+      README, getting started, install / build instructions, user guide,
+      tutorial, FAQ, troubleshooting, docs of CLI tools / server endpoints /
+      config options, guide for migrating user code between versions
+  example_main:
+    label: 1
+    desc: >-
+      the main program or README of an example / demo / sample notebook,
+      Go *_example_test.go
+  api_entry:
+    label: 1
+    desc: >-
+      entry point of the PUBLIC library / SDK users import: headers in the
+      library's public include/ dir, __init__.py / doc.go / index.ts of the
+      public package, the SDK client constructor and its main operations
+      files (collections, search, insert ...)
+  user_script:
+    label: 1
+    desc: >-
+      a script users run directly, located at the repo root
+      (e.g. convert_hf_to_gguf.py)
+  install_manifest:
+    label: 1
+    desc: >-
+      ROOT-level pyproject.toml / package.json / go.mod / requirements.txt,
+      or a documented example configuration file
+  # --- label 0 -------------------------------------------------------------
+  per_variant_impl:
+    label: 0
+    desc: >-
+      one of many sibling files each implementing one model / backend /
+      index type / data type / operator (conversion/llama.py, index/hnsw.go,
+      src/models/qwen.cpp, ggml-cuda/*.cu)
+  sdk_internal:
+    label: 0
+    desc: >-
+      SDK file that is not its main entry: option builders (*_options),
+      type / entity / column definitions, conversion, serialization, minor
+      or administrative operations
+  internal_impl:
+    label: 0
+    desc: >-
+      implementation: backends, kernels, server internals, internal/ pkg/
+      core/ packages of a server, helpers, headers next to the implementation
+      (src/*.h) — even when widely imported
+  tool_impl:
+    label: 0
+    desc: >-
+      implementation source of a CLI tool or server (tools/x/x.cpp)
+  ui_source:
+    label: 0
+    desc: >-
+      web / mobile / desktop app source: components, pages, stores,
+      services, utils, type definitions
+  example_aux:
+    label: 0
+    desc: >-
+      anything in an example other than its main program / README: build
+      and project files, resources, helper headers, secondary source files
+  maintainer_doc:
+    label: 0
+    desc: >-
+      design docs, architecture / data-flow docs, RFCs, ADRs, contributor or
+      developer guides, guides for coding agents, release process
+  ops_runbook:
+    label: 0
+    desc: >-
+      operating a deployment: cluster upgrade, metadata / storage migration,
+      log export, monitoring / dashboards setup
+  support_lib:
+    label: 0
+    desc: >-
+      code or docs of an internal support library (logging, errors, metrics,
+      tracing) of a server, including its doc.go / README
+  test_build_ci:
+    label: 0
+    desc: >-
+      tests, mocks, fixtures, benchmarks, CI/CD, build scripts, linters,
+      nested manifests — but NOT Go *_example_test.go, which is example_main
+  asset_generated:
+    label: 0
+    desc: >-
+      generated, vendored, binary, data, asset or template files
+      (e.g. chat-template .jinja), placeholders, near-empty files
+
+# {categories} is replaced with one "- <name> — <desc>" line per category.
+system: |
+
+  You classify files of a software repository for building a USER CHEATSHEET: a
+  compact reference telling a new user what the project does, how to install
+  it, and how to use it (commands, APIs, configuration).
+
+  Put every file into exactly ONE category:
+
+  {categories}
+
+  Rules:
+  - When a file fits both an include category (user_doc, example_main,
+    api_entry, user_script, install_manifest) and an exclude category, the
+    EXCLUDE category wins.  Examples: doc.go of a server's logging package is
+    support_lib; *_options.go of an SDK is sdk_internal; a grafana setup README
+    is ops_runbook; a UI data-flow doc is maintainer_doc.
+  - Use the facts after each path: "repo root" vs a nested path decides
+    user_script; "1 of N <ext> files in <dir>/" with a large N usually means
+    per_variant_impl.
+  - First decide what kind of project this is from the repo context.  For a
+    LIBRARY its exported entry points are api_entry.  For a SERVER or
+    APPLICATION, users go through its client SDK, CLI, configuration and network
+    API; the server's own packages are internal_impl or support_lib.
+  - When a content snippet is given, judge by the content; the path alone can
+    mislead (a docs/ file may be a design record, a README may be a stub).
+  - Judge every file independently, not by analogy with its neighbours.
+  - Expect only about 5-15% of files in include categories.  When unsure
+    between an include and an exclude category, choose the exclude one.
+
+  Respond with ONLY a JSON array with one object per input item, in input order:
+  [{"i": <item number>, "category": "<category>", "reason": "<at most 15 words>"}]
+
+# {context}: repository name, top-level entries and README excerpt.
+# {files}: numbered files with size, location facts and content snippets.
+user: |-
+  {context}
+
+  Files to classify:
+  {files}
+
+# Sent with every request
+request:
+  temperature: 0.0   # deterministic output for reproducible labels
+  max_tokens: 8192

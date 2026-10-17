@@ -12,24 +12,22 @@ from filescore import priority_score
 from model.train_ml_scorer import FileScorer
 
 
-# Tried in order; the first one compatible with the current feature layout wins.
-SCORER_MODELS = ["scorer_v3.pkl", "scorer_v2.pkl", "llm_scorer.pkl", "scorer.pkl"]
+SCORER_MODEL = "llm_scorer_v6.pkl"
 
 
 def _load_scorer() -> FileScorer | None:
-    base = Path(__file__).resolve().parent
-    for name in SCORER_MODELS:
-        try:
-            loaded = FileScorer.load(str(base / name))
-        except SystemExit:      # _load_model exits when the file is missing
-            continue
-        except Exception as err:
-            print(f"Skipping score model {name}: {err}")
-            continue
-        print(f"Loaded score model: {name}")
-        return loaded
-    print("No score model loaded; falling back to filescore.priority_score.")
-    return None
+    try:
+        loaded = FileScorer.load(str(Path(__file__).resolve().parent / SCORER_MODEL))
+    except SystemExit:      # _load_model exits when the file is missing
+        loaded = None
+    except Exception as err:
+        print(f"Skipping score model {SCORER_MODEL}: {err}")
+        loaded = None
+    if loaded is None:
+        print("No score model loaded; falling back to filescore.priority_score.")
+    else:
+        print(f"Loaded score model: {SCORER_MODEL}")
+    return loaded
 
 
 scorer = _load_scorer()
@@ -158,7 +156,7 @@ def _content_signal(abs_path: Path) -> int:
     return min(fences // 2 + prompts, 30)
 
 
-def _rank_key(score: float, feats: dict, content: int, rel: str) -> tuple:
+def _rank_key(score: float, feats: dict, content: int, ref_count: int, rel: str) -> tuple:
     """Sort key: model score first, then deterministic tie-breakers.
 
     Without tie-breakers a saturated model (hundreds of files at ~1.00) falls
@@ -169,19 +167,19 @@ def _rank_key(score: float, feats: dict, content: int, rel: str) -> tuple:
         -round(feats["rule_score"] / RULE_SCORE_BUCKET),   # finer-grained heuristic signal
         -content,                  # docs with more runnable snippets first
         feats["depth"],            # shallower first
-        -feats["ref_count"],       # more widely imported first
+        -ref_count,                # more widely imported first
         rel,
     )
 
 
-def _api_rank_key(score: float, feats: dict, example_refs: int, rel: str) -> tuple:
+def _api_rank_key(score: float, feats: dict, example_refs: int, ref_count: int, rel: str) -> tuple:
     """For public-API code, what the examples import is the best usefulness
     hint (llama.h, milvusclient), then the overall import count; ref_count
     alone favours internal hubs such as src/models/models.h or milvus pkg/."""
     return (
         -round(score, SCORE_TIE_DECIMALS),
         -example_refs,
-        -feats["ref_count"],
+        -ref_count,
         -round(feats["rule_score"] / RULE_SCORE_BUCKET),
         feats["depth"],
         rel,
@@ -251,7 +249,8 @@ def collect_secondary_files(root: str, exclude: set[str] | None = None) -> dict:
     `exclude` holds paths already collected as priority files, so the same
     README is not packed twice.
     """
-    from model.file_features import build_ref_counts, extract_features, features_to_vector
+    from model.file_features import extract_features, features_to_vector
+    from model.ref_counts import build_ref_counts
 
     exclude_norm = {os.path.normcase(os.path.normpath(p)) for p in (exclude or ())}
 
@@ -272,24 +271,22 @@ def collect_secondary_files(root: str, exclude: set[str] | None = None) -> dict:
     ref_counts = build_ref_counts(root, all_rel, example_counts=example_refs)
 
     candidates = [r for r in all_rel if os.path.normcase(r) not in exclude_norm]
-    feats_map = {r: extract_features(r, ref_count=ref_counts.get(r, 0)) for r in candidates}
+    feats_map = {r: extract_features(r) for r in candidates}
 
     if scorer is None:
         scores = {r: min(priority_score(r) / 100.0, 1.0) for r in candidates}
     else:
-        probas = scorer._pipeline.predict_proba(
-            [features_to_vector(feats_map[r]) for r in candidates]
-        )[:, 1] if candidates else []
-        scores = dict(zip(candidates, (float(p) for p in probas)))
+        scores = dict(zip(candidates, scorer.predict([features_to_vector(feats_map[r]) for r in candidates])))
 
     passing = [r for r in candidates if scores[r] >= SECONDARY_THRESHOLD]
     content_sig = {r: _content_signal(abs_map[r]) for r in passing}
-    passing.sort(key=lambda r: _rank_key(scores[r], feats_map[r], content_sig[r], r))
+    passing.sort(key=lambda r: _rank_key(scores[r], feats_map[r], content_sig[r], ref_counts.get(r, 0), r))
 
     # Docs carry a higher base rule_score than code, so without a quota the
     # public headers / API modules lose every slot to READMEs.
     api_code = sorted((r for r in passing if _is_api_code(feats_map[r])),
-                      key=lambda r: _api_rank_key(scores[r], feats_map[r], example_refs.get(r, 0), r))
+                      key=lambda r: _api_rank_key(scores[r], feats_map[r], example_refs.get(r, 0),
+                                                  ref_counts.get(r, 0), r))
     example_code = [r for r in passing if _is_example_code(feats_map[r])]   # already in rank order
     reserved = _select_diverse(api_code, MIN_API_CODE_FILES)
     reserved = _select_diverse(example_code, len(reserved) + MIN_EXAMPLE_CODE_FILES, picked=reserved)
