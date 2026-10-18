@@ -70,6 +70,8 @@ class FeatureExtraction:
         self.in_dirs: list[str] = list(cfg["in_dirs"])
         self.dirs = {k: set(v) for k, v in {**cfg["in_dirs"], **cfg["helper_dirs"]}.items()}
         self.names = {k: set(v) for k, v in cfg["names"].items()}
+        self.skip_names: set[str] = set(cfg["skip"]["names"])
+        self.skip_exts: set[str] = set(cfg["skip"]["extensions"])
         self.patterns = {
             k: re.compile("|".join(v) if isinstance(v, list) else v, re.I)
             for k, v in cfg["patterns"].items()
@@ -104,10 +106,8 @@ class FeatureExtraction:
         f["depth"] = depth
 
         # Hard blacklist: file names never useful for a cheatsheet regardless of
-        # directory (build scripts, lock files, editor configs, …). Imported
-        # lazily to avoid a circular dependency with filescore.
-        from filescore import SKIP_NAMES
-        if name in SKIP_NAMES:
+        # directory (build scripts, lock files, editor configs, …)
+        if name in self.skip_names:
             f.update({f"in_{d}": 0 for d in self.in_dirs}, in_maintainer_docs=0)
             f.update(dict.fromkeys(_FLAG_FEATURES, 0))
             return {**f, "in_ignored": 1, "is_dev_config": 1, "src_depth": 0, "rule_score": 0.0}

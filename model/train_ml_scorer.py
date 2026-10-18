@@ -74,15 +74,17 @@ def load_jsonl(path: str, sources: set[str] | None = None) -> tuple[list, list, 
     return X, y, meta
 
 
-# Random search over 200 configs on the qwen2.5-7b Colab labels, scored by
-# PR-AUC averaged over stratified 5-fold CV and leave-one-repo-out (train on
-# llama.cpp, test on milvus and vice versa). Against the previous sklearn GBT:
-# CV 0.637 vs 0.617, leave-one-repo-out 0.492 vs 0.437, stable across seeds.
+# Random search over 400 configs by model/tmp/tune_xgb_gold.py, scored by
+# PR-AUC against the hand-made gold lists in model/tmp/gold/ (core + useful),
+# each repo scored by a model trained on the other repo's labels. On the v9
+# qwen2.5-7b labels: 0.36 vs 0.29 for the previous params (llama.cpp 0.42 vs
+# 0.28, milvus 0.29 vs 0.31), ±0.007 across seeds. Configs leaving fewer than
+# MAX_SECONDARY_FILES files >= 0.5 in a repo were not considered.
 # scale_pos_weight stays 1 so probabilities match collector.py's 0.5 cut-off;
 # monotone constraints on rule_score did not help.
 XGB_PARAMS = dict(
-    n_estimators=300, learning_rate=0.05, max_depth=5, min_child_weight=3,
-    subsample=1.0, colsample_bytree=1.0, reg_lambda=0.5, gamma=1,
+    n_estimators=300, learning_rate=0.0538, max_depth=8, min_child_weight=2,
+    subsample=0.8, colsample_bytree=1.0, reg_lambda=5, reg_alpha=0, gamma=0,
     tree_method="hist", random_state=42,
 )
 

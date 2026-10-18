@@ -116,6 +116,97 @@ names:
                composer.json, build.gradle, pom.xml, cmakelists.txt]
 
 # ---------------------------------------------------------------------------
+# Hard blacklist
+# ---------------------------------------------------------------------------
+skip:
+  # Exact file names never useful for a cheatsheet, regardless of directory:
+  # build scripts, lock files, editor configs, CI configs and other
+  # developer-internal artefacts that the rule_score path heuristics cannot
+  # reliably exclude (a CMakeLists.txt inside examples/ still gets the
+  # in_examples bonus). extract() gives them rule_score 0.
+  names:
+    # Build systems
+    - cmakelists.txt
+    - makefile
+    - gnumakefile
+    - meson.build
+    - build.gradle
+    - build.gradle.kts
+    - settings.gradle
+    - settings.gradle.kts
+    - gradlew
+    - gradlew.bat
+    - build.bazel
+    - workspace
+    - workspace.bazel
+    - buck
+    - buildfile
+    # Android / mobile packaging
+    - proguard-rules.pro
+    - consumer-rules.pro
+    - androidmanifest.xml
+    # Lock files
+    - package-lock.json
+    - yarn.lock
+    - pnpm-lock.yaml
+    - poetry.lock
+    - pipfile.lock
+    - cargo.lock
+    - go.sum
+    - gemfile.lock
+    - composer.lock
+    # Linters / formatters / type checkers
+    - .eslintrc
+    - .eslintrc.js
+    - .eslintrc.json
+    - .eslintrc.yml
+    - .eslintrc.yaml
+    - .prettierrc
+    - .prettierrc.js
+    - .prettierrc.json
+    - .prettierrc.yml
+    - .prettierrc.yaml
+    - .babelrc
+    - babel.config.js
+    - babel.config.json
+    - .flake8
+    - .pylintrc
+    - mypy.ini
+    - ruff.toml
+    - .rubocop.yml
+    # Test / CI runners
+    - jest.config.js
+    - jest.config.ts
+    - vitest.config.ts
+    - vitest.config.js
+    - pytest.ini
+    - setup.cfg          # often only contains pytest / flake8 config
+    - tox.ini
+    # Bundlers
+    - webpack.config.js
+    - webpack.config.ts
+    - vite.config.ts
+    - vite.config.js
+    - rollup.config.js
+    # Editor / repo housekeeping
+    - .editorconfig
+    - .gitignore
+    - .gitattributes
+    - .gitmodules
+    - .dockerignore
+    - .npmignore
+    # CI/CD
+    - codecov.yml
+    - sonar-project.properties
+    - .travis.yml
+    - appveyor.yml
+  # Binary, media, archive and model-weight extensions; generate_training_data
+  # labels these 0 without the LLM
+  extensions: [.jpg, .jpeg, .png, .gif, .svg, .ico, .bmp, .mp4, .mov, .avi,
+               .mp3, .wav, .pdf, .zip, .tar, .gz, .7z, .onnx, .gguf, .bin,
+               .ckpt, .pt, .pth, .npy, .npz, .parquet]
+
+# ---------------------------------------------------------------------------
 # Regex patterns (case-insensitive). A list is joined into one alternation.
 # ---------------------------------------------------------------------------
 patterns:

@@ -25,6 +25,9 @@ Environment variables (required):
     LOCAL_LLM_BASE_URL   e.g. http://localhost:1234/v1
     LOCAL_LLM_MODEL      e.g. qwen2.5-coder-7b-instruct
     LOCAL_LLM_API_KEY    e.g. lm-studio
+Optional:
+    LOCAL_LLM_EXTRA_BODY JSON object added to every request, e.g.
+                         {"chat_template_kwargs": {"enable_thinking": false}}
 """
 
 import argparse
@@ -43,7 +46,6 @@ import yaml
 from dotenv import load_dotenv
 load_dotenv()
 
-from filescore import SKIP_EXTS, SKIP_NAMES
 from model.file_features import extract_features, features
 
 PROMPT = yaml.safe_load(Path(__file__).with_name("prompt.yaml").read_text(encoding="utf-8"))
@@ -174,6 +176,23 @@ def llm_from_env() -> tuple[openai.OpenAI, str]:
     return client, os.environ.get("LOCAL_LLM_MODEL", "gpt-3.5-turbo")
 
 
+def request_extra_body() -> dict | None:
+    """Extra JSON fields sent with every request, from LOCAL_LLM_EXTRA_BODY:
+    {"chat_template_kwargs": {"enable_thinking": false}} keeps a Qwen3.5
+    server from thinking before it answers.  Not part of the cache key; the
+    served model name has to tell such configurations apart."""
+    raw = os.environ.get("LOCAL_LLM_EXTRA_BODY", "").strip()
+    if not raw:
+        return None
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"❌ LOCAL_LLM_EXTRA_BODY is not valid JSON: {e}")
+    if not isinstance(body, dict):
+        sys.exit("❌ LOCAL_LLM_EXTRA_BODY must be a JSON object")
+    return body
+
+
 _MAINTAINER_DOC_PATH = re.compile(
     r"(^|/)docs?/(.+/)?(design[-_]?docs?|designs?|architecture|flows|rfcs?|adrs?|"
     r"development|developer[-_]guides?|internals)/", re.I)
@@ -220,6 +239,7 @@ class RepoLabeler:
     def __init__(self, repo_dir: Path, all_files: list[str], client: openai.OpenAI, model: str,
                  verify: bool = True):
         self.repo_dir, self.client, self.model, self.verify = repo_dir, client, model, verify
+        self.extra_body = request_extra_body()
         self.context = self._repo_context(all_files)
         self.dir_stats = self._dir_ext_stats(all_files)
 
@@ -285,6 +305,7 @@ class RepoLabeler:
                         context=self.context, files=self.format_batch(batch))},
                 ],
                 **PROMPT["request"],
+                extra_body=self.extra_body,
             )
         except openai.OpenAIError as e:
             raise RuntimeError(f"LLM request failed: {e}") from e
@@ -457,7 +478,7 @@ class LabelCache:
 # Candidate selection
 # ---------------------------------------------------------------------------
 
-# Asset / IDE-project extensions not covered by filescore.SKIP_EXTS
+# Asset / IDE-project extensions not in config.yaml skip.extensions
 _ASSET_EXTS = {".webp", ".avif", ".tiff", ".icns", ".ttf", ".otf", ".woff", ".woff2",
                ".eot", ".mp4", ".webm", ".ogg", ".flac", ".pbxproj", ".xcworkspacedata",
                ".xcscheme", ".plist", ".storyboard", ".xib", ".jar", ".keystore"}
@@ -500,9 +521,9 @@ def auto_negative(rel: str, feats: dict, repo_dir: Path | None = None) -> str | 
         return "vendored / generated / build-output path"
     if any(part.lower() in _VENDORED_DIRS for part in p.parts[:-1]):
         return "vendored dependency"
-    if name in SKIP_NAMES:
+    if name in features.skip_names:
         return "build, lint or lock file"
-    if ext in SKIP_EXTS or ext in _ASSET_EXTS or feats["ext_group_data"]:
+    if ext in features.skip_exts or ext in _ASSET_EXTS or feats["ext_group_data"]:
         return "binary, asset or data file"
     if _ANDROID_RES.search(rel.replace("\\", "/")):
         return "mobile app resource file"

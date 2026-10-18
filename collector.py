@@ -27,12 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from filescore import priority_score
 from model.file_features import extract_features, features, features_to_vector
 from model.ref_counts import build_ref_counts
 from model.train_ml_scorer import FileScorer
 
-SCORER_MODEL = "llm_scorer_v6.pkl"
+SCORER_MODEL = "llm_scorer_v8.pkl"
 
 # High priority filenames (case-insensitive matching)
 PRIORITY_FILES = [
@@ -190,7 +189,7 @@ class Candidate:
 
 class FileSelector:
     """Picks the files to pack.  `model` is a FileScorer pickle next to this
-    file; without one, files are scored by filescore.priority_score."""
+    file; without one, files are scored by their rule_score."""
 
     def __init__(self, model: str = SCORER_MODEL, threshold: float = SECONDARY_THRESHOLD):
         self.threshold = threshold
@@ -202,7 +201,7 @@ class FileSelector:
             print(f"Skipping score model {model}: {err}")
             self.scorer = None
         print(f"Loaded score model: {model}" if self.scorer else
-              "No score model loaded; falling back to filescore.priority_score.")
+              "No score model loaded; falling back to rule_score.")
 
     @staticmethod
     def priority(repo: Repo) -> list[str]:
@@ -227,7 +226,7 @@ class FileSelector:
         rels = [r for r in repo.files if os.path.normcase(r) not in exclude]
         feats = [extract_features(r) for r in rels]
         passing = [Candidate(r, s, f, refs.get(r, 0), example_refs.get(r, 0), self.content_signal(repo, r))
-                   for r, s, f in zip(rels, self.score(rels, feats), feats) if s >= self.threshold]
+                   for r, s, f in zip(rels, self.score(feats), feats) if s >= self.threshold]
         passing.sort(key=Candidate.rank_key)
 
         # Docs carry a higher base rule_score than code, so without a quota the
@@ -244,9 +243,9 @@ class FileSelector:
               f"keeping top {len(top)} ({len(reserved)} reserved for code)")
         return [c.rel for c in top]
 
-    def score(self, rels: list[str], feats: list[dict]) -> list[float]:
+    def score(self, feats: list[dict]) -> list[float]:
         if self.scorer is None:
-            return [min(priority_score(r) / 100.0, 1.0) for r in rels]
+            return [f["rule_score"] for f in feats]
         return self.scorer.predict([features_to_vector(f) for f in feats])
 
     @staticmethod
