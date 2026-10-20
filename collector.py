@@ -5,8 +5,9 @@ excerpts of them into one context text for the cheatsheet LLM.
   Repo          a local checkout: its files, their text, a directory tree
   FileSelector  priority files (PRIORITY_FILES at the root or one level down)
                 and secondary files: every file is scored by the model in
-                model/ and the best MAX_SECONDARY_FILES are kept, with
+                model/ and the best MAX_SECONDARY_FILES are kept (with
                 per-directory caps and slots reserved for API and example code
+                when the model is a path-only FileScorer)
   Excerpter     cuts each file to its character budget by keeping what a user
                 needs rather than its first N characters
   Language      per-language import lines and public declarations, for
@@ -31,7 +32,7 @@ from model.file_features import extract_features, features, features_to_vector
 from model.ref_counts import build_ref_counts
 from model.train_ml_scorer import FileScorer
 
-SCORER_MODEL = "llm_scorer_v8.pkl"
+SCORER_MODEL = "nn_scorer.pt"     # model/nn; a FileScorer .pkl also works
 
 # High priority filenames (case-insensitive matching)
 PRIORITY_FILES = [
@@ -80,10 +81,12 @@ def _is_example(feats: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 class Repo:
-    """A local checkout; files under IGNORE_DIRS and dot-dirs are left out."""
+    """A local checkout; files under IGNORE_DIRS and dot-dirs are left out.
+    `name` is the repository name (the checkout directory's by default)."""
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, name: str | None = None):
         self.root = Path(root)
+        self.name = name or self.root.name
 
     @classmethod
     @contextlib.contextmanager
@@ -95,7 +98,7 @@ class Repo:
             result = subprocess.run(["git", "clone", "--depth", "1", url, tmp_dir], capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(f"git clone failed: {result.stderr}")
-            yield cls(tmp_dir)
+            yield cls(tmp_dir, url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -188,13 +191,19 @@ class Candidate:
 
 
 class FileSelector:
-    """Picks the files to pack.  `model` is a FileScorer pickle next to this
-    file; without one, files are scored by their rule_score."""
+    """Picks the files to pack.  `model` is next to this file: a neural
+    scorer (.pt, model/nn/) or a FileScorer pickle; without one, files are
+    scored by their rule_score.  `threshold` defaults to the one saved with
+    a neural scorer, SECONDARY_THRESHOLD otherwise."""
 
-    def __init__(self, model: str = SCORER_MODEL, threshold: float = SECONDARY_THRESHOLD):
-        self.threshold = threshold
+    def __init__(self, model: str = SCORER_MODEL, threshold: float | None = None):
+        path = Path(__file__).resolve().parent / model
         try:
-            self.scorer = FileScorer.load(str(Path(__file__).resolve().parent / model))
+            if path.suffix == ".pt":
+                from model.nn.scorer import NNScorer     # torch is only needed for this one
+                self.scorer = NNScorer.load(path)
+            else:
+                self.scorer = FileScorer.load(str(path))
         except SystemExit:      # FileScorer.load exits when the file is missing
             self.scorer = None
         except Exception as err:
@@ -202,6 +211,7 @@ class FileSelector:
             self.scorer = None
         print(f"Loaded score model: {model}" if self.scorer else
               "No score model loaded; falling back to rule_score.")
+        self.threshold = threshold if threshold is not None else getattr(self.scorer, "threshold", SECONDARY_THRESHOLD)
 
     @staticmethod
     def priority(repo: Repo) -> list[str]:
@@ -214,19 +224,26 @@ class FileSelector:
 
         Every file is scored with the model, so important files in src/,
         package roots or CLI entry points compete with docs and examples.
-        Ties are broken by rule_score, content (runnable snippets in docs),
-        depth and how many files import them.  `exclude` holds paths already
-        collected as priority files, so the same README is not packed twice.
+        `exclude` holds paths already collected as priority files, so the
+        same README is not packed twice.
+
+        The neural scorer's ranking is used as is.  For the path-only models,
+        ties are broken by rule_score, content (runnable snippets in docs),
+        depth and how many files import them, slots are reserved for code and
+        directories are capped.
         """
         exclude = {os.path.normcase(os.path.normpath(p)) for p in exclude}
+        rels = [r for r in repo.files if os.path.normcase(r) not in exclude]
+        feats = [extract_features(r) for r in rels]
+        scores = self.score(repo, rels, feats)
+        if self.scorer is not None and not isinstance(self.scorer, FileScorer):
+            return self._top(rels, scores)
+
         print(f"Building reference counts for {len(repo.files)} files...")
         example_refs: dict[str, int] = {}
         refs = build_ref_counts(str(repo.root), repo.files, example_counts=example_refs)
-
-        rels = [r for r in repo.files if os.path.normcase(r) not in exclude]
-        feats = [extract_features(r) for r in rels]
         passing = [Candidate(r, s, f, refs.get(r, 0), example_refs.get(r, 0), self.content_signal(repo, r))
-                   for r, s, f in zip(rels, self.score(feats), feats) if s >= self.threshold]
+                   for r, s, f in zip(rels, scores, feats) if s >= self.threshold]
         passing.sort(key=Candidate.rank_key)
 
         # Docs carry a higher base rule_score than code, so without a quota the
@@ -243,10 +260,27 @@ class FileSelector:
               f"keeping top {len(top)} ({len(reserved)} reserved for code)")
         return [c.rel for c in top]
 
-    def score(self, feats: list[dict]) -> list[float]:
+    def _top(self, rels: list[str], scores: list[float]) -> list[str]:
+        """The neural scorer's MAX_SECONDARY_FILES best files.  It was trained
+        on the gold lists with every file seen next to its directory and the
+        repo, so it already weighs API code, examples and docs against each
+        other; the code quotas and directory caps of the path-only models
+        lowered its leave-one-repo-out core recall from 0.62 to 0.45 and its
+        hit rate from 0.62 to 0.40 (model/nn/README.md)."""
+        ranked = sorted((-s, r.count(os.sep), r) for s, r in zip(scores, rels) if s >= self.threshold)
+        top = [r for _, _, r in ranked[:MAX_SECONDARY_FILES]]
+        print(f"Secondary files: {len(ranked)} candidates >= {self.threshold}, keeping top {len(top)}")
+        return top
+
+    def score(self, repo: Repo, rels: list[str], feats: list[dict]) -> list[float]:
         if self.scorer is None:
             return [f["rule_score"] for f in feats]
-        return self.scorer.predict([features_to_vector(f) for f in feats])
+        if isinstance(self.scorer, FileScorer):
+            return self.scorer.predict([features_to_vector(f) for f in feats])
+        # The neural scorer compares each file with its directory and the
+        # whole repo, so it scores every file, priority files included
+        scores = self.scorer.score_repo(repo.root, repo.files, repo.name)
+        return [scores[r] for r in rels]
 
     @staticmethod
     def content_signal(repo: Repo, rel: str) -> int:

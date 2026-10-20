@@ -3,6 +3,12 @@
 Ranks every file in a repo by how useful it is for a **user** cheatsheet, so
 `collector.py` can pick which files to put in the LLM context.
 
+`collector.py` uses the PyTorch scorer in [`nn/`](nn/README.md) (`nn_scorer.pt`),
+trained on the gold lists in `tmp/gold/` with per-repo context features. The
+XGBoost pipeline below (LLM labels → path features → `FileScorer`) is kept as
+its baseline and as the fallback for a `.pkl` `SCORER_MODEL`.
+
+- `nn/`                           ← Neural scorer: repo features, `RepoContextNet`, training / evaluation (see `nn/README.md`)
 - `file_features.py`              ← `FeatureExtraction`: path features and `rule_score` (the model's inputs)
 - `ref_counts.py`                 ← Import reference counts; `collector.py` tie-breakers, not a model feature
 - `config.yaml`                   ← Directory / name / skip lists, patterns, `rule_score` weights and model `feature_columns`
@@ -13,7 +19,7 @@ Ranks every file in a repo by how useful it is for a **user** cheatsheet, so
 - `tmp/tune_xgb_gold.py`          ← Tunes `XGB_PARAMS` by PR-AUC against the cheatsheet gold lists in `tmp/gold/`
 
 ```bash
-uv pip install scikit-learn xgboost python-dotenv pyyaml openai
+uv pip install torch scikit-learn xgboost python-dotenv pyyaml openai
 ```
 
 Repos used for training live under `source/`, one directory per repo, each pinned to the commit its gold list in `tmp/gold/<repo>.yaml` refers to (`SOURCE_REPOS` in `colab_labeling.ipynb` holds the full hashes):
@@ -162,9 +168,11 @@ git -C source/llama.cpp ls-files | grep docs | python -m model.train_ml_scorer s
 
 # Step 4: collector.py
 
-`collector.py` loads `SCORER_MODEL` (`llm_scorer_v8.pkl`) and falls back to `rule_score` when it is missing or has a different feature layout.
+`collector.py` loads `SCORER_MODEL` and falls back to `rule_score` when it is missing or has a different feature layout.
 
-`collect_secondary_files` then:
+With the neural scorer (`.pt`, the default), `FileSelector.secondary` keeps its `MAX_SECONDARY_FILES` (20) best-scored files, skipping priority files and files below the scorer's floor (0.05); see `nn/README.md` for why the steps below are skipped for it.
+
+With a `FileScorer` pickle (e.g. `SCORER_MODEL = "llm_scorer_v8.pkl"`), `FileSelector.secondary` instead:
 1. computes `ref_count` (non-test importers) and example reference counts (importers under `examples/` or Go `*_example_test.go`) with `build_ref_counts`;
 2. scores every file and keeps those `>= SECONDARY_THRESHOLD` (0.5);
 3. ranks with tie-breakers: model score → `rule_score` → content signal (code blocks in docs, stub files last) → depth → `ref_count`;
