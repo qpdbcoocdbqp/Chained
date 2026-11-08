@@ -13,7 +13,9 @@ excerpts of them into one context text for the cheatsheet LLM.
   Language      per-language import lines and public declarations, for
                 Excerpter's code excerpts
 
-build_context_bundle() runs them in order on a fresh clone.
+build_context_bundle() runs them in order on a fresh clone and packs the result
+into a token budget (context_token_budget()): files that do not fit are left out
+whole and listed, never cut in the middle.
 """
 import ast
 import contextlib
@@ -28,9 +30,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from dotenv import load_dotenv
+
 from model.file_features import extract_features, features, features_to_vector
 from model.ref_counts import build_ref_counts
 from model.train_ml_scorer import FileScorer
+
+load_dotenv()   # LOCAL_LLM_CONTEXT, also when collector is used without generator (verifier.py)
 
 SCORER_MODEL = "nn_scorer.pt"     # model/nn; a FileScorer .pkl also works
 
@@ -46,10 +52,19 @@ IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", "build", ".venv", 
 
 MAX_FILE_CHARS = 6000       # Character budget of a priority file
 SECONDARY_FILE_CHARS = 2048  # Character budget of a secondary file
-MAX_TOTAL_CHARS = 60000     # Upper limit of total packaged content to avoid exceeding context
 MAX_READ_BYTES = 512 * 1024
 
+# Total context, in tokens: the model's window (LOCAL_LLM_CONTEXT) less the room kept for the answer and the prompt
+DEFAULT_CONTEXT_WINDOW = 24576  # when LOCAL_LLM_CONTEXT is not set
+OUTPUT_TOKENS = 4000        # generator.py max_tokens; keep in step
+PROMPT_TOKENS = 1500        # the task prompt and the chat template
+MIN_BUDGET_TOKENS = 1000    # a smaller budget cannot hold a README
+MIN_EXCERPT_TOKENS = 100    # no file is added when less than this is left
+TREE_BUDGET_SHARE = 6       # the directory tree may take 1/6 of the budget
+FIT_ROUNDS = 3              # times an excerpt is shrunk to fit the room left
+
 MAX_SECONDARY_FILES = 20    # Maximum number of secondary files to include
+MIN_SECONDARY_FILES = 8     # Taken below the threshold when fewer pass (e.g. a code-only package)
 SECONDARY_THRESHOLD = 0.5   # Minimum score to be considered
 MAX_PER_PARENT_DIR = 3      # e.g. at most 3 files from one examples/<name>/
 MAX_PER_TOP_DIR = 5         # e.g. at most 5 files from examples/ overall
@@ -74,6 +89,63 @@ LINE_CHARS = 200            # longer lines are cut
 
 def _is_example(feats: dict) -> bool:
     return bool(feats["in_examples"] or feats["is_example_file"])
+
+
+# ---------------------------------------------------------------------------
+# Budget and scope
+# ---------------------------------------------------------------------------
+
+@functools.cache
+def _tokenizer():
+    """tiktoken's cl100k_base when it is installed and its vocabulary can be loaded, else None."""
+    try:
+        import tiktoken
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        return None
+
+
+_CJK = re.compile(r"[⺀-鿿가-힯＀-￯]")
+
+
+def count_tokens(text: str) -> int:
+    """Tokens in `text`: tiktoken's count when available, else an estimate (3 characters per token,
+    1.5 tokens per CJK character) that errs on the high side for ordinary code and prose; text of
+    mostly punctuation counts higher than estimated.  The model's own tokenizer differs a little;
+    the room kept in context_token_budget() absorbs it."""
+    encoder = _tokenizer()
+    if encoder is not None:
+        return len(encoder.encode(text, disallowed_special=()))
+    cjk = len(_CJK.findall(text))
+    return int(cjk * 1.5 + (len(text) - cjk) / 3) + 1
+
+
+def context_token_budget() -> int:
+    """Tokens of repository context that fit the model: its context window (LOCAL_LLM_CONTEXT)
+    less the room kept for the answer and the task prompt."""
+    raw = os.environ.get("LOCAL_LLM_CONTEXT", "").strip()
+    try:
+        window = int(raw) if raw else DEFAULT_CONTEXT_WINDOW
+    except ValueError:
+        raise ValueError(f"LOCAL_LLM_CONTEXT must be a number of tokens, got {raw!r}")
+    budget = window - OUTPUT_TOKENS - PROMPT_TOKENS
+    if budget < MIN_BUDGET_TOKENS:
+        raise ValueError(f"LOCAL_LLM_CONTEXT={window} leaves {budget} tokens for the repository "
+                         f"after {OUTPUT_TOKENS + PROMPT_TOKENS} for the answer and prompt; "
+                         f"at least {MIN_BUDGET_TOKENS} are needed")
+    return budget
+
+
+def _normalize_focus(focus: Iterable[str]) -> tuple[str, ...]:
+    """Repo-relative paths with forward slashes and no leading ./ or trailing /, duplicates dropped."""
+    paths = (f.strip().replace("\\", "/").removeprefix("./").strip("/") for f in focus)
+    return tuple(dict.fromkeys(p for p in paths if p))
+
+
+def _in_focus(rel: str, focus: tuple[str, ...]) -> bool:
+    """True when `rel` is one of the `focus` paths or inside one; with no focus, every file is."""
+    path = rel.replace(os.sep, "/")
+    return not focus or any(path == f or path.startswith(f + "/") for f in focus)
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +193,17 @@ class Repo:
             return None
         return None if b"\x00" in data[:4096] else data.decode("utf-8", errors="ignore").replace("\r\n", "\n")
 
-    def tree(self, max_depth: int = 2) -> str:
-        """Directory structure (limited depth) to help the LLM understand the project layout"""
+    def tree(self, max_depth: int = 2, focus: tuple[str, ...] = ()) -> str:
+        """Directory structure (limited depth) to help the LLM understand the project layout;
+        with `focus`, that of those paths only"""
+        if focus:
+            lines = []
+            for f in focus:
+                if (self.root / f).is_dir():
+                    lines += [f"{f}/"] + Repo(self.root / f).tree(max_depth).split("\n")[1:]
+                else:
+                    lines.append(f)
+            return "\n".join(lines[:300])
         lines = []
         root_depth = str(self.root).rstrip(os.sep).count(os.sep)
         for dirpath, dirnames, filenames in self._walk():
@@ -219,13 +300,16 @@ class FileSelector:
         by_name = {rel.replace(os.sep, "/").lower(): rel for rel in repo.files if rel.count(os.sep) <= 1}
         return [by_name[t] for t in PRIORITY_FILES if t in by_name]
 
-    def secondary(self, repo: Repo, exclude: Iterable[str] = ()) -> list[str]:
+    def secondary(self, repo: Repo, exclude: Iterable[str] = (), focus: tuple[str, ...] = ()) -> list[str]:
         """The top-scoring files of the repo.
 
         Every file is scored with the model, so important files in src/,
         package roots or CLI entry points compete with docs and examples.
         `exclude` holds paths already collected as priority files, so the
-        same README is not packed twice.
+        same README is not packed twice.  With `focus` (repo-relative
+        directories or files) only files under those paths are considered; the
+        model still scores the whole repo, so a file keeps the score it has in
+        its place.
 
         The neural scorer's ranking is used as is.  For the path-only models,
         ties are broken by rule_score, content (runnable snippets in docs),
@@ -233,17 +317,20 @@ class FileSelector:
         directories are capped.
         """
         exclude = {os.path.normcase(os.path.normpath(p)) for p in exclude}
-        rels = [r for r in repo.files if os.path.normcase(r) not in exclude]
+        rels = [r for r in repo.files if os.path.normcase(r) not in exclude and _in_focus(r, focus)]
+        if focus:
+            print(f"Focus {', '.join(focus)}: {len(rels)} of {len(repo.files)} files considered")
         feats = [extract_features(r) for r in rels]
         scores = self.score(repo, rels, feats)
+        admitted = self._admitted(scores, feats)
         if self.scorer is not None and not isinstance(self.scorer, FileScorer):
-            return self._top(rels, scores)
+            return self._top(rels, scores, admitted)
 
         print(f"Building reference counts for {len(repo.files)} files...")
         example_refs: dict[str, int] = {}
         refs = build_ref_counts(str(repo.root), repo.files, example_counts=example_refs)
         passing = [Candidate(r, s, f, refs.get(r, 0), example_refs.get(r, 0), self.content_signal(repo, r))
-                   for r, s, f in zip(rels, scores, feats) if s >= self.threshold]
+                   for r, s, f, ok in zip(rels, scores, feats, admitted) if ok]
         passing.sort(key=Candidate.rank_key)
 
         # Docs carry a higher base rule_score than code, so without a quota the
@@ -260,16 +347,36 @@ class FileSelector:
               f"keeping top {len(top)} ({len(reserved)} reserved for code)")
         return [c.rel for c in top]
 
-    def _top(self, rels: list[str], scores: list[float]) -> list[str]:
+    def _admitted(self, scores: list[float], feats: list[dict]) -> list[bool]:
+        """Files scoring at least the threshold.  When fewer than
+        MIN_SECONDARY_FILES do, the best-scoring code and docs below it are
+        added (tests, mocks and ignored dirs never are): the models learned
+        what a user of a whole repo reads, so every file of an internal
+        package scores near 0, and without a floor the LLM sees only the
+        directory tree and writes the cheatsheet from file names."""
+        admitted = [s >= self.threshold for s in scores]
+        short = MIN_SECONDARY_FILES - sum(admitted)
+        if short > 0:
+            fallback = sorted((i for i, f in enumerate(feats) if not admitted[i]
+                               and (f["ext_group_code"] or f["ext_group_doc"])
+                               and not (f["in_ignored"] or f["in_tests"] or f["is_test_file"])),
+                              key=lambda i: -scores[i])
+            for i in fallback[:short]:
+                admitted[i] = True
+            print(f"Only {MIN_SECONDARY_FILES - short} files >= {self.threshold}; "
+                  f"added {min(short, len(fallback))} best-scoring code / doc files below it")
+        return admitted
+
+    def _top(self, rels: list[str], scores: list[float], admitted: list[bool]) -> list[str]:
         """The neural scorer's MAX_SECONDARY_FILES best files.  It was trained
         on the gold lists with every file seen next to its directory and the
         repo, so it already weighs API code, examples and docs against each
         other; the code quotas and directory caps of the path-only models
         lowered its leave-one-repo-out core recall from 0.62 to 0.45 and its
         hit rate from 0.62 to 0.40 (model/nn/README.md)."""
-        ranked = sorted((-s, r.count(os.sep), r) for s, r in zip(scores, rels) if s >= self.threshold)
+        ranked = sorted((-s, r.count(os.sep), r) for s, r, ok in zip(scores, rels, admitted) if ok)
         top = [r for _, _, r in ranked[:MAX_SECONDARY_FILES]]
-        print(f"Secondary files: {len(ranked)} candidates >= {self.threshold}, keeping top {len(top)}")
+        print(f"Secondary files: {len(ranked)} candidates, keeping top {len(top)}")
         return top
 
     def score(self, repo: Repo, rels: list[str], feats: list[dict]) -> list[float]:
@@ -732,7 +839,9 @@ class Go(Language):
     """Exported functions and types, with the exported fields of structs."""
     FUNC = re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Z]\w*)\b[^\n]*", re.M)
     STRUCT = re.compile(r"^type\s+([A-Z]\w*)\s+struct\s*\{\n(.*?)^\}", re.M | re.S)
-    TYPE = re.compile(r"^type\s+([A-Z]\w*)\s+(?!struct\s*\{)[^\n]*", re.M)
+    TYPE = re.compile(r"^type\s+([A-Z]\w*)\s+(?!(?:struct|interface)\s*\{)[^\n]*", re.M)
+    INTERFACE = re.compile(r"^type\s+([A-Z]\w*)\s+interface\s*\{\n(.*?)^\}", re.M | re.S)
+    METHOD = re.compile(r"^[ \t]+([A-Z]\w*)\(.*$", re.M)
 
     def declarations(self, text: str) -> list[Decl]:
         decls = [(m.start(), [m.group(1)], self._with_doc(text, m.start(), _cut_line(m.group(0).rstrip(" {"))))
@@ -742,6 +851,13 @@ class Go(Language):
             body = f"type {m.group(1)} struct {{\n" + "\n".join("\t" + f for f in fields) + "\n}"
             decls.append((m.start(), [m.group(1)], self._with_doc(text, m.start(), body)))
         decls += [(m.start(), [m.group(1)], _cut_line(m.group(0).rstrip(" {"))) for m in self.TYPE.finditer(text)]
+        # An interface is its methods, each ranked on its own and named after
+        # the interface so that it stays readable when picked alone
+        for m in self.INTERFACE.finditer(text):
+            decls.append((m.start(), [m.group(1)], f"type {m.group(1)} interface"))
+            body = m.start(2)
+            decls += [(body + k.start(), [k.group(1)], _cut_line(f"{m.group(1)}.{k.group(0).strip()}"))
+                      for k in self.METHOD.finditer(m.group(2))]
         return decls
 
 
@@ -786,32 +902,88 @@ LANGUAGES: dict[str, Language] = {
 # Bundle
 # ---------------------------------------------------------------------------
 
-def build_context_bundle(repo_url: str, selector: FileSelector | None = None):
+def build_context_bundle(repo_url: str, selector: FileSelector | None = None,
+                         focus: Iterable[str] = (), max_tokens: int | None = None):
     """Main function: clone + select + excerpt into a single text
 
-    Returns (bundle, scanned_files, truncated):
-        bundle        -- Packaged context text
-        scanned_files -- List of files actually read this time,
-                         each item is a dict: {"path": relative path, "category": "priority"|"example", "chars": actual character count}
-        truncated     -- bool, whether the packaged content was truncated due to exceeding MAX_TOTAL_CHARS
+    Returns (bundle, scanned_files, skipped):
+        bundle        -- Packaged context text, at most `max_tokens` tokens (context_token_budget() by default)
+        scanned_files -- List of files in the bundle, each item is a dict:
+                         {"path": relative path, "category": "priority"|"example", "chars": and "tokens": of the
+                         excerpt (the file header included in tokens), "text": the excerpt}
+        skipped       -- List of files left out because they did not fit the budget, each item is a dict:
+                         {"path", "category", "tokens": what the file would have taken, None when not tried};
+                         empty (falsy) when everything fit
     """
-    selector = selector or FileSelector()
     with Repo.clone(repo_url) as repo:
-        excerpter = Excerpter(repo)
-        priority = selector.priority(repo)
-        groups = (("priority", "File", priority, MAX_FILE_CHARS),
-                  ("example", "Example File", selector.secondary(repo, exclude=priority), SECONDARY_FILE_CHARS))
+        return bundle_repo(repo, repo_url, selector, focus, max_tokens)
 
-        parts = [f"# Repository: {repo_url}\n", "## Directory Structure (Partial)\n```\n" + repo.tree() + "\n```\n"]
-        scanned_files = []
-        for category, label, files, budget in groups:
-            for path in files:
-                content = excerpter.excerpt(path, budget)
-                parts.append(f"## {label}: {path}\n```\n{content}\n```\n")
-                scanned_files.append({"path": path, "category": category, "chars": len(content)})
+
+def _render(label: str, path: str, content: str) -> str:
+    return f"## {label}: {path}\n```\n{content}\n```\n"
+
+
+def _fit_lines(text: str, max_tokens: int) -> str:
+    """The leading lines of `text` that fit in `max_tokens`."""
+    lines, tokens = text.split("\n"), count_tokens(text)
+    while tokens > max_tokens and len(lines) > 1:
+        lines = lines[:max(1, int(len(lines) * max_tokens / tokens * 0.95))]
+        tokens = count_tokens("\n".join(lines))
+    return "\n".join(lines)
+
+
+def _fit_excerpt(excerpter: Excerpter, path: str, label: str, budget: int, room: int) -> tuple[str, int, bool]:
+    """Excerpt `path` into `room` tokens: with its own character `budget` first, then shrunk in proportion
+    to the overshoot.  Returns (excerpt, tokens it takes in the bundle, whether it fits)."""
+    content = excerpter.excerpt(path, budget)
+    tokens = count_tokens(_render(label, path, content))
+    for _ in range(FIT_ROUNDS):
+        if tokens <= room:
+            break
+        content = excerpter.excerpt(path, int(len(content) * room / tokens * 0.9))
+        tokens = count_tokens(_render(label, path, content))
+    return content, tokens, bool(content.strip()) and tokens <= room
+
+
+def bundle_repo(repo: Repo, title: str, selector: FileSelector | None = None,
+                focus: Iterable[str] = (), max_tokens: int | None = None):
+    """build_context_bundle() on a local checkout; `title` heads the bundle.
+
+    The budget is spent in order: the title and directory tree, then the priority files, then the secondary
+    files best first.  A file that overshoots what is left is excerpted again to fit; when it still does not,
+    it is skipped and the next, smaller one gets its chance.  `focus` limits the secondary files and the
+    directory tree to those repo-relative paths."""
+    selector = selector or FileSelector()
+    excerpter = Excerpter(repo)
+    max_tokens = max_tokens or context_token_budget()
+    focus = _normalize_focus(focus)
+    unmatched = [f for f in focus if not any(_in_focus(r, (f,)) for r in repo.files)]
+    if unmatched:
+        raise ValueError(f"--focus matches no files of the repository: {', '.join(unmatched)}")
+    priority = selector.priority(repo)
+    groups = (("priority", "File", priority, MAX_FILE_CHARS),
+              ("example", "Example File", selector.secondary(repo, exclude=priority, focus=focus),
+               SECONDARY_FILE_CHARS))
+
+    tree = _fit_lines(repo.tree(focus=focus), max_tokens // TREE_BUDGET_SHARE)
+    parts = [f"# Repository: {title}\n", "## Directory Structure (Partial)\n```\n" + tree + "\n```\n"]
+    room = max_tokens - count_tokens("\n".join(parts))
+    scanned_files, skipped = [], []
+    for category, label, files, budget in groups:
+        for path in files:
+            if room < MIN_EXCERPT_TOKENS:
+                skipped.append({"path": path, "category": category, "tokens": None})
+                continue
+            content, tokens, fits = _fit_excerpt(excerpter, path, label, budget, room)
+            if not fits:
+                skipped.append({"path": path, "category": category, "tokens": tokens})
+                continue
+            parts.append(_render(label, path, content))
+            room -= tokens
+            scanned_files.append({"path": path, "category": category, "chars": len(content),
+                                  "tokens": tokens, "text": content})
 
     bundle = "\n".join(parts)
-    truncated = len(bundle) > MAX_TOTAL_CHARS
-    if truncated:
-        bundle = bundle[:MAX_TOTAL_CHARS] + "\n\n[Content too long, truncated]"
-    return bundle, scanned_files, truncated
+    print(f"Context: {count_tokens(bundle)} / {max_tokens} tokens, {len(scanned_files)} files, "
+          f"{len(skipped)} left out for the budget")
+    return bundle, scanned_files, skipped

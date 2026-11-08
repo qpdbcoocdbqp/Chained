@@ -22,27 +22,41 @@ MODEL = os.environ.get("LOCAL_LLM_MODEL", "local-model")
 # If your service requires a real key, pass it via the LOCAL_LLM_API_KEY environment variable.
 API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "not-needed")
 
-HUMAN_CHEATSHEET_PROMPT = """你是一個資深工程師，請根據下面提供的倉庫資訊，寫一份專注於「指令操作與 API 呼叫」的簡潔"速查表"(cheat sheet)。
+# The repository context comes first and is identical in every call, so the
+# second call reuses the KV cache of the first one (vLLM automatic prefix
+# caching, llama.cpp server / Ollama prompt cache).  Only the task prompt after
+# it differs.
+CONTEXT_PREFIX = """倉庫資訊如下:
+{context}
+
+---
+
+"""
+
+HUMAN_CHEATSHEET_PROMPT = """你是一個資深工程師，請根據上面提供的倉庫資訊，寫一份專注於「指令操作與 API 呼叫」的簡潔"速查表"(cheat sheet)。
 目標讀者是已經配置好環境、想快速上手進行開發或運維的開發者。
 
 請完全忽略任何關於安裝、部屬、初始化或環境設定的內容。
 
 要求:
 - 用 Markdown 格式，多用表格、粗體與程式碼區塊，確保極高可讀性
-- 包含: 
+- 包含:
   1. 倉庫一句話核心用途簡介
-  2. 常用指令 / API 分類速查（請用表格呈現：欄位包含指令/API、核心參數、功能說明）
+  2. 常用指令 / API 分類速查（請用表格呈現：欄位包含指令/API、核心參數、功能說明、來源）
   3. 3-5 個高頻實戰場景的代碼片段或指令組合技（附程式碼區塊）
   4. 操作時的常見坑或注意事項（如果有）
+  5. 待確認（見下方出處規則；沒有就省略這一段）
 - 內容盡量精煉，像一頁紙能看完的速查表，去除所有過渡性廢話，直接給出核心乾貨
 - 不要編造倉庫中沒有出現的信息，如果信息不足，如實說明
+- 出處規則:
+  - 每個指令、API、參數後面用 [來源: <檔案路徑>] 標出它出現在哪個檔案（表格放在「來源」欄，
+    每一格都要寫成 [來源: <檔案路徑>]，連同方括號與「來源:」，不要只寫路徑；
+    路徑照抄倉庫資訊中 `## File:` 或 `## Example File:` 標題後的路徑）
+  - 倉庫資訊中找不到依據的內容不要寫進表格，改列在最後的「待確認」段落
 - 請使用繁體中文輸出
-
-倉庫資訊如下:
-{context}
 """
 
-AGENT_GUIDE_PROMPT = """你是一個為 LLM agent 準備工具說明文檔的助手。請根據下面提供的倉庫資訊，
+AGENT_GUIDE_PROMPT = """你是一個為 LLM agent 準備工具說明文檔的助手。請根據上面提供的倉庫資訊，
 生成一份結構化的 Markdown 文檔，目的是讓另一個 LLM agent 讀了之後，能夠知道如何正確調用此工具。
 
 請完全忽略任何關於安裝（Installation）、環境配置或部屬的事項。專注於可操作的介面與參數。
@@ -62,6 +76,7 @@ AGENT_GUIDE_PROMPT = """你是一個為 LLM agent 準備工具說明文檔的助
 - invocation: `具體呼叫或執行方式，如命令列或函數簽名`
 - parameters: (詳細列出必要的參數、選填的 Flags 及其型態/意義)
 - returns: (執行後的返回數據、輸出格式或預期結果)
+- source: [來源: <檔案路徑>]
 - example:
 
 ```
@@ -73,11 +88,19 @@ AGENT_GUIDE_PROMPT = """你是一個為 LLM agent 準備工具說明文檔的助
 ## Operational Notes
 (任何 LLM agent 在執行指令時需要注意的限制、依賴的環境變數、認證權限、或高風險的操作限制)
 
-不要編造倉庫中沒有出現的功能。如果資訊不足以確定某個操作細節，請明確寫"未在倉庫資訊中找到"。
-請使用繁體中文輸出。
+## 待確認
+(倉庫資訊中找不到依據、無法確定的功能或細節；沒有就寫"無")
 
-倉庫資訊如下:
-{context}
+不要編造倉庫中沒有出現的功能。如果資訊不足以確定某個操作細節，請明確寫"未在倉庫資訊中找到"。
+每個功能的 source 填它出現的檔案，路徑照抄倉庫資訊中 `## File:` 或 `## Example File:` 標題後的路徑；
+找不到依據的功能不要列為 Capability，改列在「待確認」。
+請使用繁體中文輸出。
+"""
+
+# Appended after the task prompt, so the context before it stays identical in every call (prefix cache)
+INSTRUCTIONS_TEMPLATE = """
+額外指示（使用者指定，請在遵守以上格式與規則的前提下照做）:
+{instructions}
 """
 
 
@@ -87,6 +110,9 @@ def _call_local_llm(prompt: str) -> str:
         "max_tokens": 4000,
         "temperature": 0.2,
         "messages": [{"role": "user", "content": prompt}],
+        # Thinking off: passed to the chat template by llama.cpp server / vLLM
+        # (Qwen3, Gemma 4 templates); servers that do not know it ignore it
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     req = urllib.request.Request(
         API_URL,
@@ -114,11 +140,14 @@ def _call_local_llm(prompt: str) -> str:
         raise RuntimeError(f"Invalid format returned from local LLM: {json.dumps(data, ensure_ascii=False)[:500]}")
 
 
-def generate_human_cheatsheet(context: str) -> str:
-    prompt = HUMAN_CHEATSHEET_PROMPT.format(context=context)
-    return _call_local_llm(prompt)
+def _task(prompt: str, instructions: str) -> str:
+    instructions = instructions.strip()
+    return prompt + INSTRUCTIONS_TEMPLATE.format(instructions=instructions) if instructions else prompt
 
 
-def generate_agent_guide(context: str) -> str:
-    prompt = AGENT_GUIDE_PROMPT.format(context=context)
-    return _call_local_llm(prompt)
+def generate_human_cheatsheet(context: str, instructions: str = "") -> str:
+    return _call_local_llm(CONTEXT_PREFIX.format(context=context) + _task(HUMAN_CHEATSHEET_PROMPT, instructions))
+
+
+def generate_agent_guide(context: str, instructions: str = "") -> str:
+    return _call_local_llm(CONTEXT_PREFIX.format(context=context) + _task(AGENT_GUIDE_PROMPT, instructions))
